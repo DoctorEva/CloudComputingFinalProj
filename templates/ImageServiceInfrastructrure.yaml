@@ -1,0 +1,25 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+
+Parameters:
+
+
+Resources:
+
+  ## The Query EC2 instance hosts a REST endpoint
+    ## Accepts requests like GET /images?createDtSince=2023-10-14T12:30:45Z&createDtBefore=2023-10-14T12:30:45Z
+    ## Queries the database for records and returns a JSON formatted response that includes the images' s3URL.
+    ## Accepts requests like GET /image/<s3URL>
+    ## Displays the image from given URL
+    # TODO: Create Query instance. It should have a DependsOn to the Database instance
+    # Instance should likely be running a java runtime for us to implement the service with
+  
+  ## The Capture lambda receives events on a REST endpoint
+    # TODO: Create lambda for the manager, when it receives an image it uploads it to S3 and saves the resulting
+    # S3Url and some other details about the image into the database.
+
+  ## Create a public facing API gateway, the Query and Capture lambda should be accessible through the gateway
+  # Capture lambda should require users to autheticate or present a special cert of some sort
+
+Outputs:

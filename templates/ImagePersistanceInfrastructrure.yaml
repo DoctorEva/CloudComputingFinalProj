@@ -1,0 +1,40 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+
+Parameters:
+
+
+Resources:
+
+  ## TODO, S3 bucket should be in private subnet. Will store images
+  ImgCollectBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::Region}-ImgCollectBucket'
+
+  ## TODO, DB should be in private subnet. Need to come up with what the table(s) should be.
+  ImgCollectDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Retain
+    Properties:
+      DBInstanceIndentifier: !Sub '${AWS::Region}-image-collect-db
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      AllocatedStorage: 20
+      StorageType: gp2
+      MasterUsername: !Sub '{{resolve:secretsmanager:${ImgCollectSecrets}::username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${ImgCollectSecrets}::password}}'
+
+  ImgCollectSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'Secret for DB credentials'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+Outputs:
