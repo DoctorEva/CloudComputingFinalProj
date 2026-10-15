@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Image Input</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="page-header">
+      <h1>Image Input</h1>
+      <p class="subtitle">Upload an image and describe where and when it was taken.</p>
+    </header>
+
+    <form id="image-input-form" novalidate>
+      <fieldset>
+        <legend>Image</legend>
+        <div class="field">
+          <label for="image">Image file</label>
+          <input type="file" id="image" name="image" accept="image/*" required />
+        </div>
+        <figure class="preview" id="preview" hidden>
+          <img id="preview-image" alt="Selected image preview" />
+          <figcaption id="preview-name"></figcaption>
+        </figure>
+      </fieldset>
+
+      <fieldset>
+        <legend>Details</legend>
+        <div class="field">
+          <label for="location">Location taken</label>
+          <input
+            type="text"
+            id="location"
+            name="location"
+            placeholder="e.g. Golden Gate Bridge, San Francisco"
+            required
+          />
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="latitude">Latitude</label>
+            <input
+              type="number"
+              id="latitude"
+              name="latitude"
+              step="any"
+              min="-90"
+              max="90"
+              placeholder="37.8199"
+            />
+          </div>
+          <div class="field">
+            <label for="longitude">Longitude</label>
+            <input
+              type="number"
+              id="longitude"
+              name="longitude"
+              step="any"
+              min="-180"
+              max="180"
+              placeholder="-122.4783"
+            />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="altitude">Altitude (m)</label>
+            <input
+              type="number"
+              id="altitude"
+              name="altitude"
+              step="any"
+              placeholder="45.5"
+            />
+          </div>
+          <div class="field">
+            <label for="horizontalAccuracy">Horizontal accuracy (m)</label>
+            <input
+              type="number"
+              id="horizontalAccuracy"
+              name="horizontalAccuracy"
+              step="any"
+              min="0"
+              placeholder="8"
+            />
+          </div>
+        </div>
+        <div class="field">
+          <label for="imageDt">Date and time taken</label>
+          <input type="datetime-local" id="imageDt" name="imageDt" />
+        </div>
+        <div class="field">
+          <label for="description">Description</label>
+          <textarea
+            id="description"
+            name="description"
+            rows="3"
+            placeholder="Anything notable about this image"
+          ></textarea>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Orientation</legend>
+        <div class="field-row">
+          <div class="field">
+            <label for="heading">Heading (&deg;)</label>
+            <input
+              type="number"
+              id="heading"
+              name="heading"
+              step="any"
+              min="0"
+              max="360"
+              placeholder="90"
+            />
+          </div>
+          <div class="field">
+            <label for="pitch">Pitch (&deg;)</label>
+            <input
+              type="number"
+              id="pitch"
+              name="pitch"
+              step="any"
+              min="-90"
+              max="90"
+              placeholder="-12"
+            />
+          </div>
+          <div class="field">
+            <label for="roll">Roll (&deg;)</label>
+            <input
+              type="number"
+              id="roll"
+              name="roll"
+              step="any"
+              min="-180"
+              max="180"
+              placeholder="3"
+            />
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="actions">
+        <button type="submit">Submit</button>
+        <button type="reset" class="secondary">Clear</button>
+      </div>
+    </form>
+
+    <section class="output" aria-live="polite">
+      <h2>Printed to stdout</h2>
+      <pre id="output">&lt;nothing submitted yet&gt;</pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
