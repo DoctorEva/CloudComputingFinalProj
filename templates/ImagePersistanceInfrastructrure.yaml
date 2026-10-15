@@ -24,17 +24,7 @@ Resources:
       Engine: mysql
       AllocatedStorage: 20
       StorageType: gp2
-      MasterUsername: !Sub '{{resolve:secretsmanager:${ImgCollectSecrets}::username}}'
-      MasterUserPassword: !Sub '{{resolve:secretsmanager:${ImgCollectSecrets}::password}}'
-
-  ImgCollectSecrets:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Description: 'Secret for DB credentials'
-      GenerateSecretString:
-        SecretStringTemplate: '{"username": "admin"}'
-        GenerateStringKey: password
-        PasswordLength: 32
-        ExcludeCharacters: '"@/\'
+      MasterUsername: admin
+      MasterUserPassword: tempPass
 
 Outputs:
