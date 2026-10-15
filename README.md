@@ -16,17 +16,43 @@ metadata is stored in RDB and later exposed through a read-only Lambda API.
 
 ## Architecture
 
-```text
-Browser
-  │  POST /api/images        (metadata JSON)
-  ▼
-CloudFront ──/api/*──▶ Lambda Function URL ──▶ Lambda (capture)
-  │                                             ├─ INSERT row into RDS MySQL (`images`)
-  │                                             └─ pre-signed S3 PUT URL  ──▶ image-bucket
-  │  PUT <pre-signed URL>  (image bytes) ────────────────────────────────▶ image-bucket
-  │
-  ├──/images, /image──▶ ALB ──▶ EC2 (gunicorn + Flask) ──▶ RDS MySQL
-  └──everything else──▶ S3 (static frontend)
+```mermaid
+flowchart LR
+    subgraph Edge["Edge"]
+        Browser["Browser<br/>SPA upload form"]
+        CF["CloudFront distribution<br/>single domain, path routing"]
+        FrontendBucket["S3 frontend bucket<br/>static site, private via OAC"]
+    end
+
+    subgraph Capture["Capture tier"]
+        LambdaURL["Lambda Function URL<br/>AuthType NONE, CORS POST/OPTIONS"]
+        CaptureLambda["Capture Lambda<br/>python3.12"]
+    end
+
+    subgraph Query["Query tier"]
+        ALB["ALB, internet-facing<br/>:80 HTTP"]
+        QueryEC2["EC2 t3.micro<br/>gunicorn + Flask :8080"]
+    end
+
+    subgraph Data["Data layer (external, persistence stack)"]
+        ImageBucket["S3 image-bucket"]
+        RDS["RDS MySQL :3306<br/>images table"]
+    end
+
+    Browser -->|"POST /api/images<br/>(metadata JSON)"| CF
+    CF -->|"/api/*"| LambdaURL
+    LambdaURL --> CaptureLambda
+    CaptureLambda -->|"INSERT row"| RDS
+    CaptureLambda -->|"201 + pre-signed PUT URL"| Browser
+    Browser -->|"PUT image bytes<br/>(pre-signed, direct to S3)"| ImageBucket
+
+    CF -->|"/images, /image"| ALB
+    ALB -->|"forward :8080 (ALB SG)"| QueryEC2
+    ALB -.->|"health check GET /health"| QueryEC2
+    QueryEC2 -->|"SELECT"| RDS
+    QueryEC2 -->|"302 redirect<br/>pre-signed GET"| ImageBucket
+
+    CF -->|"/* everything else"| FrontendBucket
 ```
 
 CloudFront fronts a single domain and routes by path: `/api/*` to the capture
