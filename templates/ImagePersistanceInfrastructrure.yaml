@@ -1,10 +1,6 @@
 
 AWSTemplateFormatVersion: '2010-09-09'
 
-
-Parameters:
-
-
 Resources:
 
   ## TODO, S3 bucket should be in private subnet. Will store images
@@ -12,6 +8,8 @@ Resources:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
       BucketName: !Sub '${AWS::Region}-ImgCollectBucket'
 
   ## TODO, DB should be in private subnet. Need to come up with what the table(s) should be.
@@ -19,12 +17,55 @@ Resources:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Retain
     Properties:
-      DBInstanceIndentifier: !Sub '${AWS::Region}-image-collect-db
+      DBInstanceIndentifier: !Sub '${AWS::Region}-image-collect-db'
       DBInstanceClass: db.t3.micro
       Engine: mysql
       AllocatedStorage: 20
       StorageType: gp2
       MasterUsername: admin
       MasterUserPassword: tempPass
+      DBSecurityGroups:
+        - !Ref ImgCollectDBSecurityGroup
+
+  ImgCollectDBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    # DependsOn:
+    #   - QueryServiceSecurityGroup
+    #   - CaptureServiceSecurityGroup
+    Properties:
+      GroupDescription: Ingress rules for DB
+      DBSecurityGroupIngress:
+        EC2SecurityGroupName:
+          - Ref: QueryServiceSecurityGroup
+          - Ref: CaptureServiceSecurityGroup
+
+  QueryServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access via port 80 and SSH access
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  CaptureServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access via port 80 and SSH access
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
 
 Outputs:
+
+  BucketName:
+    Value: 
+      Ref: ImgCollectBucket
+
+  DBName:
+    Value:
+      Ref: ImgCollectDB
+
