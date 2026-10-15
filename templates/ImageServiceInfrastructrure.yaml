@@ -1,25 +1,571 @@
 
 AWSTemplateFormatVersion: '2010-09-09'
 
+Description: >
+  Image capture service. Provisions the Capture Lambda exposed through a Lambda
+  Function URL on POST /api/images, and a CloudFront distribution that serves
+  the static frontend from S3 and proxies /api/* through to the function URL.
+  Also provisions the read-only query service (Flask on EC2 behind an ALB).
+  DB credentials are supplied as stack parameters; no IAM or Secrets Manager
+  resources are created by this stack.
+
 
 Parameters:
+
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: Value returned in the Access-Control-Allow-Origin response header.
+
+  # --- Lambda packaging ------------------------------------------------------
+
+  LambdaCodeBucket:
+    Type: String
+    Description: >
+      S3 bucket holding the packaged Lambda zip (lambda_function.py + pymysql).
+      See lambda/build.sh, which creates it and uploads the artifact.
+
+  LambdaCodeKey:
+    Type: String
+    Default: capture.zip
+    Description: S3 key of the packaged Lambda zip.
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+
+  LambdaHandler:
+    Type: String
+    Default: lambda_function.lambda_handler
+
+  LambdaRoleName:
+    Type: String
+    Default: LabRole
+    Description: >
+      Name of an existing IAM role the capture function assumes. The learner lab
+      provides LabRole; no IAM resources are created by this stack.
+
+  CaptureTimeout:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 29
+    Description: Seconds. Keep well under CloudFront's 30 second origin timeout.
+
+  CaptureMemory:
+    Type: Number
+    Default: 256
+    MinValue: 128
+
+  # --- Data layer (owned by the persistence stack) ---------------------------
+
+  ImageBucketName:
+    Type: String
+    Default: image-bucket
+    Description: S3 bucket that receives the pre-signed PUT uploads.
+
+  DbHost:
+    Type: String
+    Description: RDS endpoint hostname for the image-metadata instance.
+
+  DbPort:
+    Type: Number
+    Default: 3306
+
+  DbName:
+    Type: String
+    Default: image-metadata
+
+  DbUser:
+    Type: String
+    Default: admin
+    Description: Master username for the image-metadata RDS instance.
+
+  DbPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for the image-metadata RDS instance.
+
+  PresignExpiresIn:
+    Type: Number
+    Default: 900
+    Description: Lifetime in seconds of the generated pre-signed PUT URL.
+
+  KeyPrefix:
+    Type: String
+    Default: images
+    Description: Key prefix for generated S3 object keys.
+
+  # --- Static frontend -------------------------------------------------------
+
+  FrontendBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Globally unique, lowercase. Leave empty to auto-generate a name from the
+      account id and region.
+
+  # --- Query service (EC2 + ALB) ---------------------------------------------
+
+  QueryCodeKey:
+    Type: String
+    Default: query.zip
+    Description: S3 key of the packaged query service zip. See query/build.sh.
+
+  QueryInstanceType:
+    Type: String
+    Default: t3.micro
+
+  QueryInstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: >
+      Name of an existing EC2 instance profile granting S3 and SSM access. The
+      learner lab provides LabInstanceProfile; no IAM resources are created.
+
+  QueryKeyName:
+    Type: String
+    Default: ''
+    Description: Optional EC2 key pair name for SSH access.
+
+  QueryVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC shared with the RDS instance.
+
+  QuerySubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet for the query instance.
+
+  AlbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets for the load balancer.
+
+  QueryPort:
+    Type: Number
+    Default: 8080
+    Description: Port gunicorn listens on inside the instance.
+
+  DbSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >
+      Security group attached to the RDS instance. When set, a 3306 ingress rule
+      is added from the query instance. Leave empty to skip.
+
+  CloudFrontPrefixListId:
+    Type: String
+    Default: ''
+    Description: >
+      Managed prefix list id for CloudFront origin-facing addresses. When empty
+      the load balancer accepts port 80 from 0.0.0.0/0.
+
+
+Conditions:
+
+  HasFrontendBucketName: !Not [!Equals [!Ref FrontendBucketName, '']]
+  HasQueryKeyName: !Not [!Equals [!Ref QueryKeyName, '']]
+  HasDbSecurityGroupId: !Not [!Equals [!Ref DbSecurityGroupId, '']]
+  HasCloudFrontPrefixListId: !Not [!Equals [!Ref CloudFrontPrefixListId, '']]
 
 
 Resources:
 
-  ## The Query EC2 instance hosts a REST endpoint
-    ## Accepts requests like GET /images?createDtSince=2023-10-14T12:30:45Z&createDtBefore=2023-10-14T12:30:45Z
-    ## Queries the database for records and returns a JSON formatted response that includes the images' s3URL.
-    ## Accepts requests like GET /image/<s3URL>
-    ## Displays the image from given URL
-    # TODO: Create Query instance. It should have a DependsOn to the Database instance
-    # Instance should likely be running a java runtime for us to implement the service with
-  
-  ## The Capture lambda receives events on a REST endpoint
-    # TODO: Create lambda for the manager, when it receives an image it uploads it to S3 and saves the resulting
-    # S3Url and some other details about the image into the database.
+  # ===========================================================================
+  # Static frontend bucket, served only through CloudFront
+  # ===========================================================================
 
-  ## Create a public facing API gateway, the Query and Capture lambda should be accessible through the gateway
-  # Capture lambda should require users to autheticate or present a special cert of some sort
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasFrontendBucketName
+        - !Ref FrontendBucketName
+        - !Sub 'photogrammetry-frontend-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend-oac'
+        Description: Grants the CloudFront distribution read access to the frontend bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ===========================================================================
+  # Capture Lambda
+  # ===========================================================================
+
+  CaptureFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-capture'
+      Description: >
+        Stores image metadata in RDS and returns a pre-signed S3 PUT URL for the
+        client to upload the image directly to the image bucket.
+      Runtime: !Ref LambdaRuntime
+      Handler: !Ref LambdaHandler
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaRoleName}'
+      Timeout: !Ref CaptureTimeout
+      MemorySize: !Ref CaptureMemory
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          IMAGE_BUCKET: !Ref ImageBucketName
+          DB_HOST: !Ref DbHost
+          DB_PORT: !Ref DbPort
+          DB_NAME: !Ref DbName
+          DB_USER: !Ref DbUser
+          DB_PASSWORD: !Ref DbPassword
+          PRESIGN_EXPIRES_IN: !Ref PresignExpiresIn
+          KEY_PREFIX: !Ref KeyPrefix
+
+  # Lambda Function URL replaces the API Gateway REST API. CloudFront sends
+  # /api/* here; the function URL forwards any path to the handler.
+  CaptureFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref CaptureFunction
+      AuthType: NONE
+      Cors:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+        MaxAge: 3600
+
+  # ===========================================================================
+  # Query service: Flask API on a private EC2 instance behind an ALB
+  # ===========================================================================
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP ingress for the query load balancer.
+      VpcId: !Ref QueryVpcId
+      SecurityGroupIngress:
+        - !If
+          - HasCloudFrontPrefixListId
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            SourcePrefixListId: !Ref CloudFrontPrefixListId
+            Description: HTTP from CloudFront origin-facing addresses.
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+            Description: HTTP from anywhere. Set CloudFrontPrefixListId to restrict.
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  QueryInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application port ingress from the load balancer only.
+      VpcId: !Ref QueryVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref QueryPort
+          ToPort: !Ref QueryPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: gunicorn from the load balancer.
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-query'
+
+  DbIngressFromQuery:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasDbSecurityGroupId
+    Properties:
+      GroupId: !Ref DbSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref DbPort
+      ToPort: !Ref DbPort
+      SourceSecurityGroupId: !Ref QueryInstanceSecurityGroup
+      Description: MySQL from the query instance.
+
+  QueryInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref QueryInstanceType
+      IamInstanceProfile: !Ref QueryInstanceProfileName
+      SubnetId: !Ref QuerySubnetId
+      KeyName: !If [HasQueryKeyName, !Ref QueryKeyName, !Ref 'AWS::NoValue']
+      SecurityGroupIds:
+        - !Ref QueryInstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-query'
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+
+            dnf install -y python3 python3-pip unzip
+
+            id -u query &>/dev/null || useradd --system --home /opt/query --shell /sbin/nologin query
+
+            mkdir -p /opt/query
+            aws s3 cp "s3://${CodeBucket}/${CodeKey}" /tmp/query.zip --region "${AWS::Region}"
+            unzip -o /tmp/query.zip -d /opt/query
+            rm -f /tmp/query.zip
+
+            python3 -m venv /opt/query/venv
+            /opt/query/venv/bin/pip install --quiet --upgrade pip
+            /opt/query/venv/bin/pip install --quiet -r /opt/query/requirements.txt
+            chown -R query:query /opt/query
+
+            cat > /etc/systemd/system/query.service <<UNIT
+            [Unit]
+            Description=Photogrammetry query API
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            User=query
+            WorkingDirectory=/opt/query
+            Environment=DB_HOST=${DbHost}
+            Environment=DB_PORT=${DbPort}
+            Environment=DB_NAME=${DbName}
+            Environment=DB_USER=${DbUser}
+            Environment=DB_PASSWORD=${DbPassword}
+            Environment=IMAGE_BUCKET=${ImageBucketName}
+            Environment=PRESIGN_EXPIRES_IN=${PresignExpiresIn}
+            Environment=ALLOWED_ORIGIN=${AllowedOrigin}
+            Environment=AWS_REGION=${AWS::Region}
+            ExecStart=/opt/query/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:${QueryPort} app:app
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now query
+          - CodeBucket: !Ref LambdaCodeBucket
+            CodeKey: !Ref QueryCodeKey
+
+  QueryAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref AlbSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-query-alb'
+
+  QueryTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: instance
+      Protocol: HTTP
+      Port: !Ref QueryPort
+      VpcId: !Ref QueryVpcId
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckPort: !Ref QueryPort
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      Targets:
+        - Id: !Ref QueryInstance
+          Port: !Ref QueryPort
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-query-tg'
+
+  QueryListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref QueryAlb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref QueryTargetGroup
+
+  # ===========================================================================
+  # CloudFront: one distribution, three origins
+  #   /*      -> S3 frontend bucket (OAC)
+  #   /api/*  -> API Gateway regional endpoint, stage injected via OriginPath
+  #   /images -> ALB -> query instance (Flask listing)
+  #   /image  -> ALB -> query instance (Flask pre-signed redirect)
+  # ===========================================================================
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${AWS::StackName} frontend and capture API'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: FrontendS3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: CaptureApiOrigin
+            DomainName: !Select [2, !Split ['/', !GetAtt CaptureFunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginSSLProtocols:
+                - TLSv1.2
+          - Id: QueryAlbOrigin
+            DomainName: !GetAtt QueryAlb.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: CaptureApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /images
+            TargetOriginId: QueryAlbOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /image
+            TargetOriginId: QueryAlbOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
 
 Outputs:
+
+  DistributionDomainName:
+    Description: CloudFront domain serving both the frontend and the capture API.
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  DistributionId:
+    Description: CloudFront distribution id, used for cache invalidations.
+    Value: !Ref FrontendDistribution
+
+  FrontendURL:
+    Description: Public URL of the static frontend.
+    Value: !Sub 'https://${FrontendDistribution.DomainName}/'
+
+  CaptureEndpoint:
+    Description: Public URL the browser POSTs metadata to.
+    Value: !Sub 'https://${FrontendDistribution.DomainName}/api/images'
+
+  CaptureFunctionEndpoint:
+    Description: Lambda Function URL behind the /api/* behavior. Useful for debugging.
+    Value: !GetAtt CaptureFunctionUrl.FunctionUrl
+
+  FrontendBucketName:
+    Description: Bucket to sync the frontend/ directory into.
+    Value: !Ref FrontendBucket
+
+  CaptureFunctionName:
+    Value: !Ref CaptureFunction
+
+  QueryAlbDnsName:
+    Description: Load balancer DNS name behind the /images and /image routes.
+    Value: !GetAtt QueryAlb.DNSName
+
+  QueryImagesEndpoint:
+    Description: Public endpoint listing image metadata.
+    Value: !Sub 'https://${FrontendDistribution.DomainName}/images'
+
+  QueryImageEndpoint:
+    Description: Public endpoint displaying a single image by s3url.
+    Value: !Sub 'https://${FrontendDistribution.DomainName}/image'
+
+  QueryInstanceId:
+    Value: !Ref QueryInstance

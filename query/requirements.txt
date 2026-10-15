@@ -1,0 +1,4 @@
+Flask>=3.0
+gunicorn>=21.2
+PyMySQL>=1.1
+boto3>=1.34

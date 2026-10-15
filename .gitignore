@@ -1,0 +1,6 @@
+.crush/
+build/
+capture.zip
+query.zip
+__pycache__/
+*.pyc
