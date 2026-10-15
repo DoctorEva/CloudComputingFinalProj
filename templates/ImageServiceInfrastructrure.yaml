@@ -23,12 +23,15 @@ Parameters:
     Type: String
     Description: >
       S3 bucket holding the packaged Lambda zip (lambda_function.py + pymysql).
-      See lambda/build.sh, which creates it and uploads the artifact.
+      See deploy.sh, which creates it and uploads the artifact.
 
   LambdaCodeKey:
     Type: String
     Default: capture.zip
-    Description: S3 key of the packaged Lambda zip.
+    Description: >
+      S3 key of the packaged Lambda zip. deploy.sh passes a content addressed
+      key, which is what makes a changed artifact actually update the function;
+      the default is only a fallback for hand-run deploys.
 
   LambdaRuntime:
     Type: String
@@ -110,7 +113,11 @@ Parameters:
   QueryCodeKey:
     Type: String
     Default: query.zip
-    Description: S3 key of the packaged query service zip. See query/build.sh.
+    Description: >
+      S3 key of the packaged query service zip. See deploy.sh, which builds it
+      and uploads it under a content addressed name. The key is interpolated
+      into UserData, so changing it replaces the instance and re-runs the
+      bootstrap against the new artifact.
 
   QueryInstanceType:
     Type: String

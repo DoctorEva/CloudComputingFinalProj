@@ -8,6 +8,7 @@ metadata is stored in RDB and later exposed through a read-only Lambda API.
 
 | Path | Purpose |
 | --- | --- |
+| `deploy.sh` | Builds the artifacts, deploys the stack, and publishes the frontend |
 | `frontend/` | Static upload form (`index.html`, `app.js`, `styles.css`) |
 | `lambda/` | Capture service: validates metadata, writes a DB row, returns a pre-signed S3 PUT URL |
 | `query/` | Read-only Flask API over the `images` table (`GET /images`, `GET /image`) |
@@ -87,24 +88,45 @@ as stack outputs (`FrontendURL`, `CaptureEndpoint`, `QueryAlbDnsName`,
 
 ## Deployment
 
-Both scripts are environment-driven and read the `templates/` stack.
+`deploy.sh` builds the artifacts, deploys `templates/ImageServiceInfrastructrure.yaml`,
+and publishes the frontend. The stage argument selects how much of that it does:
+
+| Stage | Builds | Deploys stack | Syncs frontend |
+| --- | --- | --- | --- |
+| `all` (default) | capture + query | yes | yes |
+| `lambda` | capture | yes | no |
+| `query` | query | yes | no |
+| `frontend` | nothing | no | yes |
 
 ```bash
-# Capture Lambda + frontend (requires DB_HOST and DB_PASSWORD)
-DB_HOST=<rds-endpoint> DB_PASSWORD=<password> lambda/build.sh
-
-# Query service on EC2 + ALB (also requires VPC/subnet ids)
+# Everything: capture Lambda, query tier, and frontend
 DB_HOST=<rds-endpoint> DB_PASSWORD=<password> \
   QUERY_VPC_ID=<vpc> QUERY_SUBNET_ID=<subnet> \
-  ALB_SUBNET_IDS=<subnet-a>,<subnet-b> query/build.sh
+  ALB_SUBNET_IDS=<subnet-a>,<subnet-b> \
+  ./deploy.sh all
+
+# Just the capture Lambda after editing lambda_function.py
+DB_HOST=<rds-endpoint> DB_PASSWORD=<password> ./deploy.sh lambda
+
+# Just re-publish the static frontend
+./deploy.sh frontend
 ```
 
-`lambda/build.sh` packages the Lambda zip, deploys the stack, syncs `frontend/`
-to S3, and invalidates CloudFront. `query/build.sh` packages `query/` and
-re-deploys the same stack with the query parameters. Run the Lambda script
-first so `capture.zip` exists in the artifact bucket. Both accept `AWS_REGION`,
-`STACK_NAME`, `ARTIFACT_BUCKET`, and other overrides; see the header of each
-script for the full list.
+`DB_HOST`, `DB_PASSWORD`, `QUERY_VPC_ID`, `QUERY_SUBNET_ID`, and `ALB_SUBNET_IDS`
+are required for the stages that touch the query tier. A stage that finds no
+existing stack is upgraded to a cold start, which builds both artifacts and
+requires all five, because the VPC and subnet parameters have no defaults.
+
+Artifacts are uploaded under content addressed keys (`capture-<hash>.zip`,
+`query-<hash>.zip`) derived from the source files. That is what makes a
+redeploy take effect: a changed key changes the Lambda code reference and the
+query instance's user data, and the user data change replaces the instance so
+it installs the new code. Replacing that instance leaves the query routes
+unhealthy for a few minutes while it bootstraps, so the script waits for
+`/health` afterwards (set `SKIP_HEALTH_WAIT=1` to skip).
+
+`AWS_REGION`, `STACK_NAME`, `ARTIFACT_BUCKET`, `LAMBDA_CODE_KEY`,
+`QUERY_CODE_KEY`, and other overrides are documented at the top of `deploy.sh`.
 
 ## Database Definition
 

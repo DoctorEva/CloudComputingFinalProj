@@ -2,5 +2,7 @@
 build/
 capture.zip
 query.zip
+capture-*.zip
+query-*.zip
 __pycache__/
 *.pyc
