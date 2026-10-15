@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Image Search</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container wide">
+    <nav class="site-nav" aria-label="Site">
+      <a href="index.html">Upload</a>
+      <a href="search.html" aria-current="page">Search</a>
+    </nav>
+
+    <header class="page-header">
+      <h1>Image Search</h1>
+      <p class="subtitle">Filter images by any field, using fuzzy, exact, or range matching.</p>
+    </header>
+
+    <form id="image-search-form" novalidate>
+      <fieldset>
+        <legend>Name &amp; description</legend>
+
+        <div class="search-field" data-field="name" data-kind="text">
+          <span class="search-label">Name</span>
+          <div class="mode" role="radiogroup" aria-label="Name match mode">
+            <label><input type="radio" name="nameMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="nameMode" value="fuzzy" /> Fuzzy</label>
+            <label><input type="radio" name="nameMode" value="exact" /> Exact</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="text" name="nameFuzzy" data-mode="fuzzy" placeholder="Fuzzy, e.g. golden gate bridg" hidden />
+            <input type="text" name="nameExact" data-mode="exact" placeholder="Exact name" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="location" data-kind="text">
+          <span class="search-label">Location</span>
+          <div class="mode" role="radiogroup" aria-label="Location match mode">
+            <label><input type="radio" name="locationMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="locationMode" value="fuzzy" /> Fuzzy</label>
+            <label><input type="radio" name="locationMode" value="exact" /> Exact</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="text" name="locationFuzzy" data-mode="fuzzy" placeholder="Fuzzy, e.g. san fransisco" hidden />
+            <input type="text" name="locationExact" data-mode="exact" placeholder="Exact location" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="description" data-kind="text">
+          <span class="search-label">Description</span>
+          <div class="mode" role="radiogroup" aria-label="Description match mode">
+            <label><input type="radio" name="descriptionMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="descriptionMode" value="fuzzy" /> Fuzzy</label>
+            <label><input type="radio" name="descriptionMode" value="exact" /> Exact</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="text" name="descriptionFuzzy" data-mode="fuzzy" placeholder="Fuzzy, e.g. sunset over the bay" hidden />
+            <input type="text" name="descriptionExact" data-mode="exact" placeholder="Exact description" hidden />
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Position</legend>
+
+        <div class="search-field" data-field="latitude" data-kind="numeric">
+          <span class="search-label">Latitude</span>
+          <div class="mode" role="radiogroup" aria-label="Latitude match mode">
+            <label><input type="radio" name="latitudeMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="latitudeMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="latitudeMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="number" name="latitudeExact" data-mode="exact" step="any" min="-90" max="90" placeholder="Exact" hidden />
+            <input type="number" name="latitudeMin" data-mode="range" step="any" min="-90" max="90" placeholder="Min" hidden />
+            <input type="number" name="latitudeMax" data-mode="range" step="any" min="-90" max="90" placeholder="Max" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="longitude" data-kind="numeric">
+          <span class="search-label">Longitude</span>
+          <div class="mode" role="radiogroup" aria-label="Longitude match mode">
+            <label><input type="radio" name="longitudeMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="longitudeMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="longitudeMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="number" name="longitudeExact" data-mode="exact" step="any" min="-180" max="180" placeholder="Exact" hidden />
+            <input type="number" name="longitudeMin" data-mode="range" step="any" min="-180" max="180" placeholder="Min" hidden />
+            <input type="number" name="longitudeMax" data-mode="range" step="any" min="-180" max="180" placeholder="Max" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="altitude" data-kind="numeric">
+          <span class="search-label">Altitude (m)</span>
+          <div class="mode" role="radiogroup" aria-label="Altitude match mode">
+            <label><input type="radio" name="altitudeMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="altitudeMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="altitudeMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="number" name="altitudeExact" data-mode="exact" step="any" placeholder="Exact" hidden />
+            <input type="number" name="altitudeMin" data-mode="range" step="any" placeholder="Min" hidden />
+            <input type="number" name="altitudeMax" data-mode="range" step="any" placeholder="Max" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="horizontalAccuracy" data-kind="numeric">
+          <span class="search-label">Horizontal accuracy (m)</span>
+          <div class="mode" role="radiogroup" aria-label="Horizontal accuracy match mode">
+            <label><input type="radio" name="horizontalAccuracyMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="horizontalAccuracyMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="horizontalAccuracyMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="number" name="horizontalAccuracyExact" data-mode="exact" step="any" min="0" placeholder="Exact" hidden />
+            <input type="number" name="horizontalAccuracyMin" data-mode="range" step="any" min="0" placeholder="Min" hidden />
+            <input type="number" name="horizontalAccuracyMax" data-mode="range" step="any" min="0" placeholder="Max" hidden />
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Orientation</legend>
+
+        <div class="search-field" data-field="heading" data-kind="numeric">
+          <span class="search-label">Heading (&deg;)</span>
+          <div class="mode" role="radiogroup" aria-label="Heading match mode">
+            <label><input type="radio" name="headingMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="headingMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="headingMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="number" name="headingExact" data-mode="exact" step="any" min="0" max="360" placeholder="Exact" hidden />
+            <input type="number" name="headingMin" data-mode="range" step="any" min="0" max="360" placeholder="Min" hidden />
+            <input type="number" name="headingMax" data-mode="range" step="any" min="0" max="360" placeholder="Max" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="pitch" data-kind="numeric">
+          <span class="search-label">Pitch (&deg;)</span>
+          <div class="mode" role="radiogroup" aria-label="Pitch match mode">
+            <label><input type="radio" name="pitchMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="pitchMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="pitchMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="number" name="pitchExact" data-mode="exact" step="any" min="-90" max="90" placeholder="Exact" hidden />
+            <input type="number" name="pitchMin" data-mode="range" step="any" min="-90" max="90" placeholder="Min" hidden />
+            <input type="number" name="pitchMax" data-mode="range" step="any" min="-90" max="90" placeholder="Max" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="roll" data-kind="numeric">
+          <span class="search-label">Roll (&deg;)</span>
+          <div class="mode" role="radiogroup" aria-label="Roll match mode">
+            <label><input type="radio" name="rollMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="rollMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="rollMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="number" name="rollExact" data-mode="exact" step="any" min="-180" max="180" placeholder="Exact" hidden />
+            <input type="number" name="rollMin" data-mode="range" step="any" min="-180" max="180" placeholder="Min" hidden />
+            <input type="number" name="rollMax" data-mode="range" step="any" min="-180" max="180" placeholder="Max" hidden />
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Time</legend>
+
+        <div class="search-field" data-field="imageDt" data-kind="datetime">
+          <span class="search-label">Date and time taken</span>
+          <div class="mode" role="radiogroup" aria-label="Image date match mode">
+            <label><input type="radio" name="imageDtMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="imageDtMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="imageDtMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="datetime-local" name="imageDtExact" data-mode="exact" aria-label="Image date exact" hidden />
+            <input type="datetime-local" name="imageDtSince" data-mode="range" aria-label="Image date since" hidden />
+            <input type="datetime-local" name="imageDtBefore" data-mode="range" aria-label="Image date before" hidden />
+          </div>
+        </div>
+
+        <div class="search-field" data-field="createDt" data-kind="datetime">
+          <span class="search-label">Date and time added</span>
+          <div class="mode" role="radiogroup" aria-label="Record date match mode">
+            <label><input type="radio" name="createDtMode" value="any" checked /> Any</label>
+            <label><input type="radio" name="createDtMode" value="exact" /> Exact</label>
+            <label><input type="radio" name="createDtMode" value="range" /> Range</label>
+          </div>
+          <div class="mode-inputs">
+            <input type="datetime-local" name="createDtExact" data-mode="exact" aria-label="Record date exact" hidden />
+            <input type="datetime-local" name="createDtSince" data-mode="range" aria-label="Record date since" hidden />
+            <input type="datetime-local" name="createDtBefore" data-mode="range" aria-label="Record date before" hidden />
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Advanced</legend>
+        <div class="field">
+          <label for="s3url">Exact image URL (s3url)</label>
+          <input type="text" id="s3url" name="s3url" placeholder="https://image-bucket.s3.../images/....jpg" />
+        </div>
+        <div class="field">
+          <label for="bbox">Bounding box (minLon,minLat,maxLon,maxLat)</label>
+          <input type="text" id="bbox" name="bbox" placeholder="-122.5,37.7,-122.4,37.8" />
+        </div>
+        <div class="field">
+          <label for="fuzzyThreshold">Fuzzy threshold (0&ndash;1, blank = server default)</label>
+          <input type="number" id="fuzzyThreshold" name="fuzzyThreshold" min="0" max="1" step="0.05" placeholder="0.6" />
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="orderBy">Order by</label>
+            <select id="orderBy" name="orderBy">
+              <option value="createDt" selected>createDt</option>
+              <option value="imageDt">imageDt</option>
+              <option value="name">name</option>
+              <option value="location">location</option>
+              <option value="latitude">latitude</option>
+              <option value="longitude">longitude</option>
+              <option value="altitude">altitude</option>
+              <option value="horizontalAccuracy">horizontalAccuracy</option>
+              <option value="heading">heading</option>
+              <option value="pitch">pitch</option>
+              <option value="roll">roll</option>
+              <option value="description">description</option>
+              <option value="s3url">s3url</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="order">Direction</label>
+            <select id="order" name="order">
+              <option value="desc" selected>Descending</option>
+              <option value="asc">Ascending</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="limit">Page size</label>
+            <input type="number" id="limit" name="limit" min="1" max="500" step="1" value="24" />
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="actions">
+        <button type="submit">Search</button>
+        <button type="reset" class="secondary">Clear</button>
+      </div>
+    </form>
+
+    <section class="output" aria-live="polite">
+      <h2>Results</h2>
+      <p id="search-status" class="status">Fill in one or more fields, then search.</p>
+      <div id="search-results" class="results-grid"></div>
+      <div class="pager">
+        <button type="button" id="prev-page" class="secondary" disabled>Previous</button>
+        <button type="button" id="next-page" class="secondary" disabled>Next</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="search.js"></script>
+</body>
+</html>

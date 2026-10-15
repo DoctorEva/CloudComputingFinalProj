@@ -8,6 +8,11 @@
 </head>
 <body>
   <main class="container">
+    <nav class="site-nav" aria-label="Site">
+      <a href="index.html" aria-current="page">Upload</a>
+      <a href="search.html">Search</a>
+    </nav>
+
     <header class="page-header">
       <h1>Image Input</h1>
       <p class="subtitle">Upload an image and describe where and when it was taken.</p>
@@ -28,6 +33,16 @@
 
       <fieldset>
         <legend>Details</legend>
+        <div class="field">
+          <label for="name">Name</label>
+          <input
+            type="text"
+            id="name"
+            name="name"
+            placeholder="e.g. Golden Gate at dawn"
+            required
+          />
+        </div>
         <div class="field">
           <label for="location">Location taken</label>
           <input

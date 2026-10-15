@@ -9,7 +9,7 @@ metadata is stored in RDB and later exposed through a read-only Lambda API.
 | Path | Purpose |
 | --- | --- |
 | `deploy.sh` | Builds the artifacts, deploys the stack, and publishes the frontend |
-| `frontend/` | Static upload form (`index.html`, `app.js`, `styles.css`) |
+| `frontend/` | Static pages: upload form (`index.html`, `app.js`) and image search (`search.html`, `search.js`), sharing `styles.css` |
 | `lambda/` | Capture service: validates metadata, writes a DB row, returns a pre-signed S3 PUT URL |
 | `query/` | Read-only Flask API over the `images` table (`GET /images`, `GET /image`) |
 | `templates/` | CloudFormation stacks for the storage layer and the running services |
@@ -19,7 +19,7 @@ metadata is stored in RDB and later exposed through a read-only Lambda API.
 ```mermaid
 flowchart LR
     subgraph Edge["Edge"]
-        Browser["Browser<br/>SPA upload form"]
+        Browser["Browser<br/>SPA upload + search"]
         CF["CloudFront distribution<br/>single domain, path routing"]
         FrontendBucket["S3 frontend bucket<br/>static site, private via OAC"]
     end
@@ -63,17 +63,30 @@ Balancer, and all other paths to the static frontend bucket.
 
 ### Frontend (`frontend/`)
 
-A single-page form: pick an image (with local preview), fill in location,
-coordinates, altitude, capture time, description, and heading/pitch/roll.
-On submit it POSTs the metadata as JSON to `/api/images`, then PUTs the raw
-file to the pre-signed URL the API returns. The response is echoed into a
-`<pre>` block and to `console.log`.
+Two static pages sharing one stylesheet.
+
+`index.html` is the upload form: pick an image (with local preview), fill in a
+name, location, coordinates, altitude, capture time, description, and
+heading/pitch/roll. On submit it POSTs the metadata as JSON to `/api/images`,
+then PUTs the raw file to the pre-signed URL the API returns. The response is
+echoed into a `<pre>` block and to `console.log`.
+
+`search.html` is the image search page. Every filterable field offers a mode
+toggle: text fields (`name`, `location`, `description`) take
+`Any`/`Fuzzy`/`Exact`, and numeric and datetime fields take
+`Any`/`Exact`/`Range`. In `Fuzzy` mode it sends `<field>Fuzzy` and the results
+come back relevance-ranked (each card shows a Match percentage); `Exact` sends
+`<field>Exact`; `Range` sends `<field>Min`/`<field>Max` (numeric) or
+`<field>Since`/`<field>Before` (datetime). Results render as a grid of
+thumbnails (each loaded through `/image?url=`) with metadata captions, plus
+ordering, a fuzzy threshold, a page size, and prev/next paging. All values are
+written with DOM text APIs, never raw HTML.
 
 ### Capture Lambda (`lambda/`)
 
 `lambda_function.py` runs on Python 3.12. It:
 
-1. Parses and validates the request body, requiring `location`.
+1. Parses and validates the request body, requiring `name` and `location`.
 2. Maps fields onto the `images` columns, coercing numerics and
    normalizing `imageDt` (user-supplied capture time) to a MySQL datetime.
 3. Stamps `createDt` server-side in UTC.
@@ -94,11 +107,23 @@ file to the pre-signed URL the API returns. The response is echoed into a
 
 `/images` supports range filters (`latitudeMin/Max`, `longitudeMin/Max`,
 `altitudeMin/Max`, `headingMin/Max`, `pitchMin/Max`, `rollMin/Max`,
-`horizontalAccuracyMin/Max`), datetime filters (`imageDt`/`createDt` with
-`Since`/`Before` suffixes), substring filters (`location`, `description`), an
-exact `s3url` match, a `bbox=minLon,minLat,maxLon,maxLat` bounding box,
-`orderBy` + `order`, and `limit`/`offset` paging. Numbers, datetimes, and
-`Decimal` values are serialized with datetimes rendered as ISO-8601 UTC (`Z`).
+`horizontalAccuracyMin/Max`), an exact match for any column via a `<field>Exact`
+parameter (e.g. `latitudeExact`, `locationExact`, `imageDtExact`), datetime
+filters (`imageDt`/`createDt` with `Since`/`Before` suffixes), substring filters
+(`name`, `location`, `description`), an exact `s3url` match, a
+`bbox=minLon,minLat,maxLon,maxLat` bounding box, `orderBy` + `order`, and
+`limit`/`offset` paging. Numbers, datetimes, and `Decimal` values are
+serialized with datetimes rendered as ISO-8601 UTC (`Z`).
+
+`name`, `location`, and `description` also accept a `<field>Fuzzy` parameter for
+typo-tolerant matching. Fuzzy terms are scored in the query service with a
+`difflib` similarity ratio (whole-string plus a per-token best match) rather
+than in SQL, so they rely on the other filters to narrow the rows first. A row
+is kept only when it reaches the threshold for every fuzzy field (AND), results
+are ranked by relevance (each image carries a `fuzzyScore`), and paging is
+applied after ranking. Tune the threshold per request with `fuzzyThreshold`
+(0..1, default `FUZZY_THRESHOLD` 0.6); the candidate set is capped at
+`FUZZY_MAX_ROWS` (default 2000).
 
 ### Infrastructure (`templates/`)
 
@@ -159,6 +184,7 @@ unhealthy for a few minutes while it bootstraps, so the script waits for
 ```sql
 CREATE TABLE images (
     `s3url` VARCHAR(256) CHARACTER SET ascii NOT NULL,
+    `name` VARCHAR(255) DEFAULT NULL,
     `location` VARCHAR(255) DEFAULT NULL,
     `latitude` DECIMAL(9,6) DEFAULT NULL,
     `longitude` DECIMAL(9,6) DEFAULT NULL,

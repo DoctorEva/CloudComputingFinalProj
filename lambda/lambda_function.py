@@ -51,6 +51,7 @@ NUMERIC_FIELDS = {
     "roll": "roll",
 }
 TEXT_FIELDS = {
+    "name": "name",
     "location": "location",
     "description": "description",
 }
@@ -163,11 +164,16 @@ def _utcnow():
 
 def build_record(payload):
     """Validate the payload and map it onto the `images` table columns."""
+    name = _clean_text(payload.get("name"), max_length=255)
+    if not name:
+        raise ValidationError("Field 'name' is required")
+
     location = _clean_text(payload.get("location"), max_length=255)
     if not location:
         raise ValidationError("Field 'location' is required")
 
     record = {
+        "name": name,
         "location": location,
         "latitude": None,
         "longitude": None,
@@ -241,6 +247,7 @@ def insert_metadata(record):
     creds = _db_credentials()
     columns = [
         "s3url",
+        "name",
         "location",
         "latitude",
         "longitude",

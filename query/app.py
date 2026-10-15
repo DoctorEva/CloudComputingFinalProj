@@ -14,6 +14,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
+from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
 import boto3
@@ -45,8 +46,15 @@ ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 DEFAULT_LIMIT = int(os.environ.get("DEFAULT_LIMIT", "100"))
 MAX_LIMIT = int(os.environ.get("MAX_LIMIT", "500"))
 
+# Fuzzy text matching runs in Python (edit-distance), so the candidate set it
+# scores is bounded. Rows that pass every non-fuzzy filter are fetched up to
+# FUZZY_MAX_ROWS, scored, ranked, and then paged in memory.
+FUZZY_THRESHOLD = float(os.environ.get("FUZZY_THRESHOLD", "0.6"))
+FUZZY_MAX_ROWS = int(os.environ.get("FUZZY_MAX_ROWS", "2000"))
+
 COLUMNS = [
     "s3url",
+    "name",
     "location",
     "latitude",
     "longitude",
@@ -72,6 +80,8 @@ NUMERIC_COLUMNS = {
 }
 
 # filter param -> column. Only these names are ever interpolated into SQL.
+# Each column also accepts `<name>Exact` for an equality match; numeric and
+# datetime columns additionally accept the range suffixes applied below.
 RANGE_FILTERS = {
     "latitude": "latitude",
     "longitude": "longitude",
@@ -86,8 +96,16 @@ DATETIME_FILTERS = {
     "imageDt": "imageDt",
 }
 TEXT_FILTERS = {
+    "name": "name",
     "location": "location",
     "description": "description",
+}
+# Fuzzy columns: `<name>Fuzzy` params are scored in Python with an
+# edit-distance ratio rather than in SQL. Keys are param names.
+FUZZY_FILTERS = {
+    "name": "name",
+    "description": "description",
+    "location": "location",
 }
 # orderBy param values are restricted to real column names.
 ORDER_COLUMNS = {column: column for column in COLUMNS}
@@ -128,6 +146,25 @@ def _connect():
     )
 
 
+def _fetch_rows(sql, params):
+    """Run a read-only query and return all rows."""
+    try:
+        connection = _connect()
+    except pymysql.MySQLError:
+        logger.exception("Database connection failed")
+        raise ApiError(503, "Database unavailable") from None
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            return cursor.fetchall()
+    except pymysql.MySQLError:
+        logger.exception("Query failed")
+        raise ApiError(500, "Query failed") from None
+    finally:
+        connection.close()
+
+
 def _parse_datetime(value, field):
     """Parse an ISO-8601 instant and return a naive UTC datetime for MySQL."""
     raw = value.strip()
@@ -157,6 +194,103 @@ def _parse_int(value, field):
         raise ApiError(400, f"'{field}' must be an integer") from None
 
 
+def _normalize_text(value):
+    """Lowercase and collapse whitespace so comparisons ignore formatting."""
+    return " ".join(str(value).lower().split())
+
+
+def _similarity(query, value):
+    """Return a 0..1 similarity between a fuzzy query term and a column value.
+
+    Compares the whole normalized strings and, as a fallback that tolerates
+    reordering and partial words, the mean best match of each query token
+    against the value's tokens. Whichever scores higher wins.
+    """
+    if not value:
+        return 0.0
+
+    needle = _normalize_text(query)
+    haystack = _normalize_text(value)
+    if not needle or not haystack:
+        return 0.0
+    if needle == haystack:
+        return 1.0
+
+    whole = SequenceMatcher(None, needle, haystack).ratio()
+    haystack_tokens = haystack.split()
+    token_scores = []
+    for token in needle.split():
+        best = 0.0
+        for other in haystack_tokens:
+            best = max(best, SequenceMatcher(None, token, other).ratio())
+        token_scores.append(best)
+    if token_scores:
+        token_score = sum(token_scores) / len(token_scores)
+    else:
+        token_score = 0.0
+    return max(whole, token_score)
+
+
+def _fuzzy_terms(args):
+    """Return {column: term} for every non-empty `<field>Fuzzy` parameter."""
+    terms = {}
+    for name, column in FUZZY_FILTERS.items():
+        value = args.get(f"{name}Fuzzy")
+        if value and value.strip():
+            terms[column] = value.strip()
+    return terms
+
+
+def _parse_threshold(value):
+    """Validate the optional fuzzyThreshold override."""
+    if value is None or value == "":
+        return FUZZY_THRESHOLD
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, "'fuzzyThreshold' must be a number") from None
+    if not 0.0 <= threshold <= 1.0:
+        raise ApiError(400, "'fuzzyThreshold' must be between 0 and 1")
+    return threshold
+
+
+def _score_rows(rows, terms, threshold):
+    """Return (row, relevance) pairs matching every fuzzy column, best first.
+
+    A row must reach the threshold for every column, matching the AND semantics
+    of the other filters. Relevance is the mean of the per-column scores. The
+    sort is stable, so the SQL ORDER BY applied before the fetch breaks ties.
+    """
+    scored = []
+    for row in rows:
+        scores = []
+        for column, term in terms.items():
+            score = _similarity(term, row.get(column))
+            if score < threshold:
+                break
+            scores.append(score)
+        else:
+            scored.append((row, sum(scores) / len(scores)))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored
+
+
+def _fuzzy_page(rows, terms, threshold, offset, limit):
+    """Rank rows by relevance, then slice out the requested page."""
+    if len(rows) >= FUZZY_MAX_ROWS:
+        logger.warning(
+            "Fuzzy candidate set hit FUZZY_MAX_ROWS=%s; may be truncated",
+            FUZZY_MAX_ROWS,
+        )
+    page = _score_rows(rows, terms, threshold)[offset:offset + limit]
+    images = []
+    for row, score in page:
+        image = _serialize(row)
+        image["fuzzyScore"] = round(score, 3)
+        images.append(image)
+    return images
+
+
 def _serialize(row):
     out = {}
     for key, value in row.items():
@@ -172,10 +306,39 @@ def _serialize(row):
     return out
 
 
-def _build_filters(args):
-    """Translate query params into (where_clauses, params)."""
+def _exact_filters(args):
+    """Return (clauses, params) for `<field>Exact` equality params.
+
+    Every filterable column gets an exact match: `<field>Exact` compares with
+    `=` using the same parser as the column's range/date/substring filter.
+    """
     clauses = []
     params = []
+
+    for name, column in RANGE_FILTERS.items():
+        value = args.get(f"{name}Exact")
+        if value:
+            clauses.append(f"`{column}` = %s")
+            params.append(_parse_number(value, f"{name}Exact"))
+
+    for name, column in DATETIME_FILTERS.items():
+        value = args.get(f"{name}Exact")
+        if value:
+            clauses.append(f"`{column}` = %s")
+            params.append(_parse_datetime(value, f"{name}Exact"))
+
+    for name, column in TEXT_FILTERS.items():
+        value = args.get(f"{name}Exact")
+        if value:
+            clauses.append(f"`{column}` = %s")
+            params.append(value.strip())
+
+    return clauses, params
+
+
+def _build_filters(args):
+    """Translate query params into (where_clauses, params)."""
+    clauses, params = _exact_filters(args)
 
     for name, column in DATETIME_FILTERS.items():
         since = args.get(f"{name}Since")
@@ -296,28 +459,26 @@ def list_images():
         raise ApiError(400, "'offset' must not be negative")
 
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    sql = (
-        f"SELECT {', '.join('`' + c + '`' for c in COLUMNS)} FROM images"
-        f"{where} ORDER BY {order_sql} LIMIT %s OFFSET %s"
-    )
+    columns_sql = ", ".join('`' + c + '`' for c in COLUMNS)
+    select = f"SELECT {columns_sql} FROM images{where}"
 
-    try:
-        connection = _connect()
-    except pymysql.MySQLError:
-        logger.exception("Database connection failed")
-        raise ApiError(503, "Database unavailable") from None
+    fuzzy_terms = _fuzzy_terms(request.args)
+    if fuzzy_terms:
+        # Relevance ordering is done in Python, so fetch the candidate set
+        # (already ordered for tie-breaking) and page it after scoring.
+        threshold = _parse_threshold(request.args.get("fuzzyThreshold"))
+        rows = _fetch_rows(
+            f"{select} ORDER BY {order_sql} LIMIT %s",
+            params + [FUZZY_MAX_ROWS],
+        )
+        images = _fuzzy_page(rows, fuzzy_terms, threshold, offset, limit)
+    else:
+        rows = _fetch_rows(
+            f"{select} ORDER BY {order_sql} LIMIT %s OFFSET %s",
+            params + [limit, offset],
+        )
+        images = [_serialize(row) for row in rows]
 
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(sql, params + [limit, offset])
-            rows = cursor.fetchall()
-    except pymysql.MySQLError:
-        logger.exception("Query failed")
-        raise ApiError(500, "Query failed") from None
-    finally:
-        connection.close()
-
-    images = [_serialize(row) for row in rows]
     payload = {
         "count": len(images),
         "limit": limit,
