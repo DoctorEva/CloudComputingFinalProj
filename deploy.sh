@@ -1,48 +1,54 @@
 #!/usr/bin/env bash
 #
-# Deploys the network stack, builds the capture Lambda and query service
-# artifacts, deploys the service stack, and publishes the static frontend.
-# Everything is driven by environment variables so the script works unchanged
-# against different accounts and regions.
+# Deploys the network stack, the persistence stack, builds the capture Lambda
+# and query service artifacts, deploys the service stack, and publishes the
+# static frontend. Everything is driven by environment variables so the script
+# works unchanged against different accounts and regions.
 #
-#   ./deploy.sh [all|vpc|lambda|query|frontend]  stage defaults to all
+#   ./deploy.sh [all|vpc|persistence|lambda|query|frontend]  defaults to all
 #
-#   vpc       deploy the network stack (VPC, subnets, gateways), no artifacts
-#   all       build both artifacts, deploy the stack, sync the frontend
-#   lambda    build the capture artifact, deploy the Lambda side of the stack
-#   query     build the query artifact, deploy the EC2/ALB side of the stack
-#   frontend  sync frontend/ and invalidate CloudFront, no stack update
+#   vpc          deploy the network stack (VPC, subnets, gateways), no artifacts
+#   persistence  deploy the data layer (image bucket, RDS, DB security group)
+#   all          deploy persistence, build both artifacts, deploy the stack,
+#                sync the frontend
+#   lambda       build the capture artifact, deploy the Lambda side of the stack
+#   query        build the query artifact, deploy the EC2/ALB side of the stack
+#   frontend     sync frontend/ and invalidate CloudFront, no stack update
 #
 # Required, by stage:
 #
-#   vpc          none
-#   all, query   DB_HOST, DB_PASSWORD, and the query network (see below)
-#   lambda       DB_HOST, DB_PASSWORD
-#   frontend     none; the stack must already exist
+#   vpc               none
+#   persistence       DB_PASSWORD, and the network (see below)
+#   all, query        DB_PASSWORD, and the network (see below)
+#   lambda            DB_PASSWORD, and the network (see below)
+#   frontend          none; the stack must already exist
 #
-# The query network (QUERY_VPC_ID, QUERY_SUBNET_ID, ALB_SUBNET_IDS) is read from
-# the network stack outputs when those variables are not set in the environment,
-# so run './deploy.sh vpc' once before the first all/query deploy. Environment
-# values override the stack outputs. A stage that finds no existing service
-# stack is upgraded to a cold start: it builds both artifacts and resolves the
-# query network the same way, because QueryVpcId, QuerySubnetId and AlbSubnetIds
-# have no template defaults and the stack cannot be created without them.
+# The network (QUERY_VPC_ID, QUERY_SUBNET_ID, ALB_SUBNET_IDS and
+# PRIVATE_SUBNET_IDS) is read from the network stack outputs when those
+# variables are not set in the environment, so run './deploy.sh vpc' once before
+# the first persistence/all/query/lambda deploy. Environment values override the
+# stack outputs. A stage that finds no existing service stack is upgraded to a
+# cold start: it builds both artifacts and resolves the network the same way,
+# because QueryVpcId, QuerySubnetId, AlbSubnetIds and LambdaSubnetIds have no
+# template defaults and the stack cannot be created without them.
 #
 # Optional:
 #
 #   DB_USER                      default admin
-#   DB_NAME                      default image-metadata
+#   DB_NAME                      default imagemetadata (letters and numbers only)
 #   DB_PORT                      default 3306
-#   IMAGE_BUCKET_NAME            default image-bucket
+#   DB_INSTANCE_CLASS            default db.t3.micro
+#   DB_ALLOCATED_STORAGE         default 20
+#   IMAGE_BUCKET_NAME            default empty (persistence derives <region>-img-collect-bucket)
 #   LAMBDA_ROLE_NAME             default LabRole
 #   QUERY_INSTANCE_TYPE          default t3.micro
 #   QUERY_INSTANCE_PROFILE_NAME  default LabInstanceProfile
 #   QUERY_KEY_NAME               default empty (no SSH key)
-#   DB_SECURITY_GROUP_ID         default empty (security group of the RDS instance)
 #   CLOUDFRONT_PREFIX_LIST_ID    default empty (falls back to 0.0.0.0/0 on port 80)
 #   FRONTEND_BUCKET_NAME         default empty (generated from account and region)
 #   STACK_NAME                   default image-capture-service
 #   VPC_STACK_NAME               default image-vpc
+#   PERSISTENCE_STACK_NAME       default image-persistence
 #   ARTIFACT_BUCKET              default image-capture-artifacts-<account-id>
 #   AWS_REGION                   default us-east-1
 #   AWS_PROFILE                  default empty (ambient credentials)
@@ -57,25 +63,27 @@
 # re-runs against the new object. Set LAMBDA_CODE_KEY or QUERY_CODE_KEY to pin a
 # fixed name, which loses that change detection.
 #
-# QUERY_KEY_NAME, DB_SECURITY_GROUP_ID and CLOUDFRONT_PREFIX_LIST_ID are sticky:
-# they are only sent when non-empty, so a later run without them keeps the value
-# already on the stack. Set CLEAR_OPTIONAL=1 to send them as empty and remove the
-# conditional resources.
+# QUERY_KEY_NAME and CLOUDFRONT_PREFIX_LIST_ID are sticky: they are only sent
+# when non-empty, so a later run without them keeps the value already on the
+# stack. Set CLEAR_OPTIONAL=1 to send them as empty and remove the conditional
+# resources.
 #
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
 STACK_NAME="${STACK_NAME:-image-capture-service}"
 VPC_STACK_NAME="${VPC_STACK_NAME:-image-vpc}"
-IMAGE_BUCKET_NAME="${IMAGE_BUCKET_NAME:-image-bucket}"
-DB_NAME="${DB_NAME:-image-metadata}"
+PERSISTENCE_STACK_NAME="${PERSISTENCE_STACK_NAME:-image-persistence}"
+IMAGE_BUCKET_NAME="${IMAGE_BUCKET_NAME:-}"
+DB_NAME="${DB_NAME:-imagemetadata}"
 DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-admin}"
+DB_INSTANCE_CLASS="${DB_INSTANCE_CLASS:-db.t3.micro}"
+DB_ALLOCATED_STORAGE="${DB_ALLOCATED_STORAGE:-20}"
 LAMBDA_ROLE_NAME="${LAMBDA_ROLE_NAME:-LabRole}"
 QUERY_INSTANCE_TYPE="${QUERY_INSTANCE_TYPE:-t3.micro}"
 QUERY_INSTANCE_PROFILE_NAME="${QUERY_INSTANCE_PROFILE_NAME:-LabInstanceProfile}"
 QUERY_KEY_NAME="${QUERY_KEY_NAME:-}"
-DB_SECURITY_GROUP_ID="${DB_SECURITY_GROUP_ID:-}"
 CLOUDFRONT_PREFIX_LIST_ID="${CLOUDFRONT_PREFIX_LIST_ID:-}"
 FRONTEND_BUCKET_NAME="${FRONTEND_BUCKET_NAME:-}"
 CLEAR_OPTIONAL="${CLEAR_OPTIONAL:-0}"
@@ -84,6 +92,7 @@ STAGE="${1:-all}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${ROOT}/templates/ImageServiceInfrastructrure.yaml"
 VPC_TEMPLATE="${ROOT}/templates/ImageVPC.yaml"
+PERSISTENCE_TEMPLATE="${ROOT}/templates/ImagePersistanceInfrastructrure.yaml"
 BUILD_DIR="${ROOT}/build"
 
 AWS=()
@@ -99,9 +108,9 @@ fi
 AWS+=(--region "${REGION}")
 
 case "${STAGE}" in
-  all|vpc|lambda|query|frontend) ;;
+  all|vpc|persistence|lambda|query|frontend) ;;
   *)
-    echo "usage: $(basename "$0") [all|vpc|lambda|query|frontend]" >&2
+    echo "usage: $(basename "$0") [all|vpc|persistence|lambda|query|frontend]" >&2
     exit 2
     ;;
 esac
@@ -163,7 +172,7 @@ output() {
 }
 
 COLD_START=0
-if [[ "${STAGE}" != vpc ]]; then
+if [[ "${STAGE}" != vpc && "${STAGE}" != persistence ]]; then
   if [[ "${STAGE}" == frontend ]]; then
     if ! stack_exists; then
       echo "stack ${STACK_NAME} does not exist; run './deploy.sh all' first" >&2
@@ -179,12 +188,16 @@ BUILD_LAMBDA=0
 BUILD_QUERY=0
 DEPLOY_QUERY_PARAMS=0
 DEPLOY_VPC=0
+DEPLOY_PERSISTENCE=0
 if [[ "${STAGE}" == vpc ]]; then
   DEPLOY_VPC=1
+elif [[ "${STAGE}" == persistence ]]; then
+  DEPLOY_PERSISTENCE=1
 elif [[ "${STAGE}" == all || "${COLD_START}" == 1 ]]; then
   BUILD_LAMBDA=1
   BUILD_QUERY=1
   DEPLOY_QUERY_PARAMS=1
+  DEPLOY_PERSISTENCE=1
 elif [[ "${STAGE}" == lambda ]]; then
   BUILD_LAMBDA=1
 elif [[ "${STAGE}" == query ]]; then
@@ -192,11 +205,16 @@ elif [[ "${STAGE}" == query ]]; then
   DEPLOY_QUERY_PARAMS=1
 fi
 
+SERVICE_STAGE=1
+if [[ "${STAGE}" == frontend || "${STAGE}" == vpc || "${STAGE}" == persistence ]]; then
+  SERVICE_STAGE=0
+fi
+
 if [[ "${BUILD_LAMBDA}" == 1 || "${BUILD_QUERY}" == 1 ]]; then
   require_cmd zip
   require_cmd python3
 fi
-if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]] && ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+if [[ "${SERVICE_STAGE}" == 1 ]] && ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   echo "sha256sum or shasum is required" >&2
   exit 1
 fi
@@ -215,10 +233,11 @@ require_sources() {
 }
 
 resolve_query_network() {
-  if [[ -z "${QUERY_VPC_ID:-}" || -z "${QUERY_SUBNET_ID:-}" || -z "${ALB_SUBNET_IDS:-}" ]] \
+  if [[ -z "${QUERY_VPC_ID:-}" || -z "${QUERY_SUBNET_ID:-}" || -z "${ALB_SUBNET_IDS:-}" || -z "${PRIVATE_SUBNET_IDS:-}" ]] \
     && ! stack_exists "${VPC_STACK_NAME}"; then
-    echo "query network parameters are missing and stack ${VPC_STACK_NAME} does not exist" >&2
-    echo "run './deploy.sh vpc' first, or set QUERY_VPC_ID, QUERY_SUBNET_ID and ALB_SUBNET_IDS" >&2
+    echo "network parameters are missing and stack ${VPC_STACK_NAME} does not exist" >&2
+    echo "run './deploy.sh vpc' first, or set QUERY_VPC_ID, QUERY_SUBNET_ID, ALB_SUBNET_IDS" >&2
+    echo "and PRIVATE_SUBNET_IDS explicitly" >&2
     exit 1
   fi
   if [[ -z "${QUERY_VPC_ID:-}" ]]; then
@@ -230,31 +249,36 @@ resolve_query_network() {
   if [[ -z "${ALB_SUBNET_IDS:-}" ]]; then
     ALB_SUBNET_IDS="$(stack_output "${VPC_STACK_NAME}" PublicSubnetIds)"
   fi
-  if [[ -z "${QUERY_VPC_ID:-}" || -z "${QUERY_SUBNET_ID:-}" || -z "${ALB_SUBNET_IDS:-}" ]]; then
-    echo "could not resolve the query network from stack ${VPC_STACK_NAME}" >&2
-    echo "set QUERY_VPC_ID, QUERY_SUBNET_ID and ALB_SUBNET_IDS explicitly" >&2
+  if [[ -z "${PRIVATE_SUBNET_IDS:-}" ]]; then
+    PRIVATE_SUBNET_IDS="$(stack_output "${VPC_STACK_NAME}" PrivateSubnetIds)"
+  fi
+  if [[ -z "${QUERY_VPC_ID:-}" || -z "${QUERY_SUBNET_ID:-}" || -z "${ALB_SUBNET_IDS:-}" || -z "${PRIVATE_SUBNET_IDS:-}" ]]; then
+    echo "could not resolve the network from stack ${VPC_STACK_NAME}" >&2
+    echo "set QUERY_VPC_ID, QUERY_SUBNET_ID, ALB_SUBNET_IDS and PRIVATE_SUBNET_IDS explicitly" >&2
     exit 1
   fi
-  echo ">> query network: vpc ${QUERY_VPC_ID}, subnet ${QUERY_SUBNET_ID}, alb subnets ${ALB_SUBNET_IDS}"
+  echo ">> network: vpc ${QUERY_VPC_ID}, subnet ${QUERY_SUBNET_ID}, alb subnets ${ALB_SUBNET_IDS}, private subnets ${PRIVATE_SUBNET_IDS}"
 }
 
-if [[ "${STAGE}" == all || "${STAGE}" == query ]]; then
-  require DB_HOST "e.g. image-metadata.abc123.us-east-1.rds.amazonaws.com"
+if [[ "${STAGE}" == all || "${STAGE}" == query || "${STAGE}" == lambda || "${STAGE}" == persistence ]]; then
   require DB_PASSWORD
   resolve_query_network
-elif [[ "${STAGE}" == lambda ]]; then
-  require DB_HOST "e.g. image-metadata.abc123.us-east-1.rds.amazonaws.com"
-  require DB_PASSWORD
 fi
 
 if [[ "${COLD_START}" == 1 ]]; then
   resolve_query_network
 fi
 
+if [[ "${SERVICE_STAGE}" == 1 && "${DEPLOY_PERSISTENCE}" != 1 ]] && ! stack_exists "${PERSISTENCE_STACK_NAME}"; then
+  echo "stack ${PERSISTENCE_STACK_NAME} does not exist; the service stack imports its outputs" >&2
+  echo "run './deploy.sh persistence' first, or './deploy.sh all'" >&2
+  exit 1
+fi
+
 LAMBDA_CODE_KEY="${LAMBDA_CODE_KEY:-}"
 QUERY_CODE_KEY="${QUERY_CODE_KEY:-}"
 
-if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]]; then
+if [[ "${SERVICE_STAGE}" == 1 ]]; then
   require_sources "${LAMBDA_SOURCES[@]}"
   if [[ -z "${LAMBDA_CODE_KEY}" ]]; then
     LAMBDA_CODE_KEY="capture-$(hash_of "${LAMBDA_SOURCES[@]}").zip"
@@ -274,7 +298,7 @@ if [[ -z "${ARTIFACT_BUCKET:-}" ]]; then
 fi
 
 PREVIOUS_INSTANCE_ID=""
-if [[ "${STAGE}" != frontend && "${STAGE}" != vpc && "${COLD_START}" == 0 ]]; then
+if [[ "${SERVICE_STAGE}" == 1 && "${COLD_START}" == 0 ]]; then
   PREVIOUS_INSTANCE_ID="$(output QueryInstanceId)"
 fi
 
@@ -367,17 +391,37 @@ if [[ "${DEPLOY_VPC}" == 1 ]]; then
     --no-fail-on-empty-changeset
 fi
 
-if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]]; then
+if [[ "${DEPLOY_PERSISTENCE}" == 1 ]]; then
   PARAMS=()
-  add_param LambdaCodeBucket "${ARTIFACT_BUCKET}"
-  add_param LambdaCodeKey "${LAMBDA_CODE_KEY}"
-  add_param ImageBucketName "${IMAGE_BUCKET_NAME}"
-  add_param LambdaRoleName "${LAMBDA_ROLE_NAME}"
-  add_param DbHost "${DB_HOST:-}"
-  add_param DbPort "${DB_PORT}"
+  add_param VpcId "${QUERY_VPC_ID:-}"
+  add_param DbSubnetIds "${PRIVATE_SUBNET_IDS:-}"
   add_param DbName "${DB_NAME}"
   add_param DbUser "${DB_USER}"
   add_param DbPassword "${DB_PASSWORD:-}"
+  add_param DbInstanceClass "${DB_INSTANCE_CLASS}"
+  add_param DbAllocatedStorage "${DB_ALLOCATED_STORAGE}"
+  add_param ImageBucketName "${IMAGE_BUCKET_NAME}"
+
+  echo ">> validating ${PERSISTENCE_TEMPLATE}"
+  "${AWS[@]}" cloudformation validate-template --template-body "file://${PERSISTENCE_TEMPLATE}" >/dev/null
+
+  echo ">> deploying stack ${PERSISTENCE_STACK_NAME}"
+  "${AWS[@]}" cloudformation deploy \
+    --template-file "${PERSISTENCE_TEMPLATE}" \
+    --stack-name "${PERSISTENCE_STACK_NAME}" \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides "${PARAMS[@]}"
+fi
+
+if [[ "${SERVICE_STAGE}" == 1 ]]; then
+  PARAMS=()
+  add_param LambdaCodeBucket "${ARTIFACT_BUCKET}"
+  add_param LambdaCodeKey "${LAMBDA_CODE_KEY}"
+  add_param LambdaRoleName "${LAMBDA_ROLE_NAME}"
+  add_param DbPort "${DB_PORT}"
+  add_param DbUser "${DB_USER}"
+  add_param DbPassword "${DB_PASSWORD:-}"
+  add_param LambdaSubnetIds "${PRIVATE_SUBNET_IDS:-}"
   add_optional_param FrontendBucketName "${FRONTEND_BUCKET_NAME}"
 
   if [[ "${DEPLOY_QUERY_PARAMS}" == 1 ]]; then
@@ -388,7 +432,6 @@ if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]]; then
     add_param QuerySubnetId "${QUERY_SUBNET_ID:-}"
     add_param AlbSubnetIds "${ALB_SUBNET_IDS:-}"
     add_optional_param QueryKeyName "${QUERY_KEY_NAME}"
-    add_optional_param DbSecurityGroupId "${DB_SECURITY_GROUP_ID}"
     add_optional_param CloudFrontPrefixListId "${CLOUDFRONT_PREFIX_LIST_ID}"
   fi
 
@@ -407,7 +450,7 @@ if [[ "${STAGE}" == all || "${STAGE}" == frontend ]]; then
   sync_frontend
 fi
 
-if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]]; then
+if [[ "${SERVICE_STAGE}" == 1 ]]; then
   INSTANCE_ID="$(output QueryInstanceId)"
   if [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "${PREVIOUS_INSTANCE_ID}" ]]; then
     if [[ "${SKIP_HEALTH_WAIT:-0}" != 1 ]]; then
@@ -421,6 +464,11 @@ if [[ "${STAGE}" == vpc ]]; then
   echo "   vpc      : $(stack_output "${VPC_STACK_NAME}" VpcId)"
   echo "   subnets  : $(stack_output "${VPC_STACK_NAME}" PublicSubnetIds)"
   echo "   private  : $(stack_output "${VPC_STACK_NAME}" PrivateSubnet)"
+elif [[ "${STAGE}" == persistence ]]; then
+  echo "   bucket   : $(stack_output "${PERSISTENCE_STACK_NAME}" BucketName)"
+  echo "   dbhost   : $(stack_output "${PERSISTENCE_STACK_NAME}" DBHost)"
+  echo "   dbname   : $(stack_output "${PERSISTENCE_STACK_NAME}" DBName)"
+  echo "   dbsg     : $(stack_output "${PERSISTENCE_STACK_NAME}" DBSecurityGroupId)"
 else
   echo "   frontend : $(output FrontendURL)"
   echo "   bucket   : $(output FrontendBucketName)"

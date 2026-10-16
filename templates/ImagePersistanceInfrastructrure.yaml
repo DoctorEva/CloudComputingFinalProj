@@ -1,71 +1,132 @@
 
 AWSTemplateFormatVersion: '2010-09-09'
 
+Description: >
+  Data layer for the photogrammetry service. Provisions the S3 bucket that
+  stores image bytes, the RDS MySQL instance that stores image metadata, and
+  the security group attached to the instance. The VPC and subnets come from
+  the network stack, and the workloads (query instance, capture Lambda) add
+  their own ingress rules. Credentials are supplied as stack parameters; no
+  Secrets Manager resources are created.
+
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC shared with the query instance and the capture Lambda.
+
+  DbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Private subnets for the database subnet group. RDS requires subnets in at
+      least two availability zones.
+
+  ImageBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Globally unique, lowercase name for the image bucket. Leave empty to
+      derive it from the region.
+
+  DbName:
+    Type: String
+    Default: imagemetadata
+    Description: >
+      Name of the database to create on the instance. RDS only allows letters
+      and numbers here.
+
+  DbUser:
+    Type: String
+    Default: admin
+    Description: Master username for the RDS instance.
+
+  DbPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for the RDS instance.
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+
+
+Conditions:
+
+  HasImageBucketName: !Not [!Equals [!Ref ImageBucketName, '']]
+
+
 Resources:
 
-  ## TODO, S3 bucket should be in private subnet. Will store images
   ImgCollectBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     Properties:
-      WebsiteConfiguration:
-        IndexDocument: index.html
-      BucketName: !Sub '${AWS::Region}-ImgCollectBucket'
+      BucketName: !If
+        - HasImageBucketName
+        - !Ref ImageBucketName
+        - !Sub '${AWS::Region}-img-collect-bucket'
 
-  ## TODO, DB should be in private subnet. Need to come up with what the table(s) should be.
+  ImgCollectDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the image metadata database
+      SubnetIds: !Ref DbSubnetIds
+
+  ## The query instance and the capture Lambda add their own ingress rules, so
+  ## this group starts with no inbound access.
+  ImgCollectDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Ingress rules for the image metadata database
+      VpcId: !Ref VpcId
+
   ImgCollectDB:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Retain
     Properties:
-      DBInstanceIndentifier: !Sub '${AWS::Region}-image-collect-db'
-      DBInstanceClass: db.t3.micro
+      DBInstanceIdentifier: !Sub '${AWS::Region}-image-collect-db'
+      DBInstanceClass: !Ref DbInstanceClass
       Engine: mysql
-      AllocatedStorage: 20
+      AllocatedStorage: !Ref DbAllocatedStorage
       StorageType: gp2
-      MasterUsername: admin
-      MasterUserPassword: tempPass
-      DBSecurityGroups:
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbUser
+      MasterUserPassword: !Ref DbPassword
+      DBSubnetGroupName: !Ref ImgCollectDBSubnetGroup
+      VPCSecurityGroups:
         - !Ref ImgCollectDBSecurityGroup
-
-  ImgCollectDBSecurityGroup:
-    Type: AWS::RDS::DBSecurityGroup
-    # DependsOn:
-    #   - QueryServiceSecurityGroup
-    #   - CaptureServiceSecurityGroup
-    Properties:
-      GroupDescription: Ingress rules for DB
-      DBSecurityGroupIngress:
-        EC2SecurityGroupName:
-          - Ref: QueryServiceSecurityGroup
-          - Ref: CaptureServiceSecurityGroup
-
-  QueryServiceSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Enable HTTP access via port 80 and SSH access
-      SecurityGroupIngress:
-      - IpProtocol: tcp
-        FromPort: 80
-        ToPort: 80
-        CidrIp: 0.0.0.0/0
-
-  CaptureServiceSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Enable HTTP access via port 80 and SSH access
-      SecurityGroupIngress:
-      - IpProtocol: tcp
-        FromPort: 80
-        ToPort: 80
-        CidrIp: 0.0.0.0/0
+      PubliclyAccessible: false
 
 Outputs:
 
   BucketName:
-    Value: 
+    Description: Bucket that stores image bytes.
+    Value:
       Ref: ImgCollectBucket
+    Export:
+      Name: photogrammetry-image-bucket
+
+  DBHost:
+    Description: RDS endpoint hostname for the image metadata database.
+    Value:
+      !GetAtt ImgCollectDB.Endpoint.Address
+    Export:
+      Name: photogrammetry-db-host
 
   DBName:
+    Description: Database holding the images table.
     Value:
-      Ref: ImgCollectDB
+      !Ref DbName
+    Export:
+      Name: photogrammetry-db-name
 
+  DBSecurityGroupId:
+    Description: Security group attached to the RDS instance.
+    Value:
+      !Ref ImgCollectDBSecurityGroup
+    Export:
+      Name: photogrammetry-db-security-group-id

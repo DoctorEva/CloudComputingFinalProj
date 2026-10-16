@@ -111,7 +111,6 @@ Resources:
     DependsOn: VPC
     Properties:
       VpcId: !Ref VPC
-      MapPublicIpOnLaunch: true
       CidrBlock: 10.0.1.0/24
       AvailabilityZone: !Select
         - 0
@@ -120,6 +119,20 @@ Resources:
       Tags:
         - Key: Name
           Value: Image Private Subnet
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Image Private Subnet 2
 
   PublicRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -138,6 +151,15 @@ Resources:
     Properties:
       RouteTableId: !Ref PrivateRouteTable
       SubnetId: !Ref PrivateSubnet
+
+  PrivateRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - PrivateRouteTable
+      - PrivateSubnet2
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
 
   PublicRouteTableAssociation2:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -182,3 +204,22 @@ Outputs:
     Export:
       Name:
         'Fn::Sub': '${AWS::StackName}-PrivateSubnetID'
+
+  PrivateSubnet2:
+    Description: The second private subnet ID, for the RDS subnet group
+    Value:
+      Ref: PrivateSubnet2
+    Export:
+      Name:
+        'Fn::Sub': '${AWS::StackName}-PrivateSubnet2ID'
+
+  PrivateSubnetIds:
+    Description: Comma separated private subnet IDs for the RDS subnet group and Lambda
+    Value:
+      'Fn::Join':
+        - ','
+        - - Ref: PrivateSubnet
+          - Ref: PrivateSubnet2
+    Export:
+      Name:
+        'Fn::Sub': '${AWS::StackName}-PrivateSubnetIDs'

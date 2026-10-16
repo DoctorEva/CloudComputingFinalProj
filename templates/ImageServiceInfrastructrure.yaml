@@ -61,33 +61,22 @@ Parameters:
     MinValue: 128
 
   # --- Data layer (owned by the persistence stack) ---------------------------
-
-  ImageBucketName:
-    Type: String
-    Default: image-bucket
-    Description: S3 bucket that receives the pre-signed PUT uploads.
-
-  DbHost:
-    Type: String
-    Description: RDS endpoint hostname for the image-metadata instance.
+  # The image bucket, database host and database name are imported from the
+  # persistence stack exports; only the credentials are passed in as parameters.
 
   DbPort:
     Type: Number
     Default: 3306
 
-  DbName:
-    Type: String
-    Default: image-metadata
-
   DbUser:
     Type: String
     Default: admin
-    Description: Master username for the image-metadata RDS instance.
+    Description: Master username for the RDS instance owned by the persistence stack.
 
   DbPassword:
     Type: String
     NoEcho: true
-    Description: Master password for the image-metadata RDS instance.
+    Description: Master password for the RDS instance owned by the persistence stack.
 
   PresignExpiresIn:
     Type: Number
@@ -147,17 +136,14 @@ Parameters:
     Type: List<AWS::EC2::Subnet::Id>
     Description: At least two public subnets for the load balancer.
 
+  LambdaSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets the capture Lambda is attached to for RDS access.
+
   QueryPort:
     Type: Number
     Default: 8080
     Description: Port gunicorn listens on inside the instance.
-
-  DbSecurityGroupId:
-    Type: String
-    Default: ''
-    Description: >
-      Security group attached to the RDS instance. When set, a 3306 ingress rule
-      is added from the query instance. Leave empty to skip.
 
   CloudFrontPrefixListId:
     Type: String
@@ -171,7 +157,6 @@ Conditions:
 
   HasFrontendBucketName: !Not [!Equals [!Ref FrontendBucketName, '']]
   HasQueryKeyName: !Not [!Equals [!Ref QueryKeyName, '']]
-  HasDbSecurityGroupId: !Not [!Equals [!Ref DbSecurityGroupId, '']]
   HasCloudFrontPrefixListId: !Not [!Equals [!Ref CloudFrontPrefixListId, '']]
 
 
@@ -226,14 +211,18 @@ Resources:
         S3Key: !Ref LambdaCodeKey
       Environment:
         Variables:
-          IMAGE_BUCKET: !Ref ImageBucketName
-          DB_HOST: !Ref DbHost
+          IMAGE_BUCKET: !ImportValue photogrammetry-image-bucket
+          DB_HOST: !ImportValue photogrammetry-db-host
           DB_PORT: !Ref DbPort
-          DB_NAME: !Ref DbName
+          DB_NAME: !ImportValue photogrammetry-db-name
           DB_USER: !Ref DbUser
           DB_PASSWORD: !Ref DbPassword
           PRESIGN_EXPIRES_IN: !Ref PresignExpiresIn
           KEY_PREFIX: !Ref KeyPrefix
+      VpcConfig:
+        SubnetIds: !Ref LambdaSubnetIds
+        SecurityGroupIds:
+          - !Ref CaptureFunctionSecurityGroup
 
   # Lambda Function URL replaces the API Gateway REST API. CloudFront sends
   # /api/* here; the function URL forwards any path to the handler.
@@ -247,7 +236,6 @@ Resources:
           - '*'
         AllowMethods:
           - POST
-          - OPTIONS
         AllowHeaders:
           - content-type
         MaxAge: 3600
@@ -293,16 +281,34 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-query'
 
+  CaptureFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Capture Lambda access to the database.
+      VpcId: !Ref QueryVpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-capture'
+
   DbIngressFromQuery:
     Type: AWS::EC2::SecurityGroupIngress
-    Condition: HasDbSecurityGroupId
     Properties:
-      GroupId: !Ref DbSecurityGroupId
+      GroupId: !ImportValue photogrammetry-db-security-group-id
       IpProtocol: tcp
       FromPort: !Ref DbPort
       ToPort: !Ref DbPort
       SourceSecurityGroupId: !Ref QueryInstanceSecurityGroup
       Description: MySQL from the query instance.
+
+  DbIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue photogrammetry-db-security-group-id
+      IpProtocol: tcp
+      FromPort: !Ref DbPort
+      ToPort: !Ref DbPort
+      SourceSecurityGroupId: !Ref CaptureFunctionSecurityGroup
+      Description: MySQL from the capture Lambda.
 
   QueryInstance:
     Type: AWS::EC2::Instance
@@ -351,7 +357,7 @@ Resources:
             Environment=DB_NAME=${DbName}
             Environment=DB_USER=${DbUser}
             Environment=DB_PASSWORD=${DbPassword}
-            Environment=IMAGE_BUCKET=${ImageBucketName}
+            Environment=IMAGE_BUCKET=${ImageBucket}
             Environment=PRESIGN_EXPIRES_IN=${PresignExpiresIn}
             Environment=ALLOWED_ORIGIN=${AllowedOrigin}
             Environment=AWS_REGION=${AWS::Region}
@@ -367,6 +373,9 @@ Resources:
             systemctl enable --now query
           - CodeBucket: !Ref LambdaCodeBucket
             CodeKey: !Ref QueryCodeKey
+            DbHost: !ImportValue photogrammetry-db-host
+            DbName: !ImportValue photogrammetry-db-name
+            ImageBucket: !ImportValue photogrammetry-image-bucket
 
   QueryAlb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
