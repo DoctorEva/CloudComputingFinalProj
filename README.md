@@ -12,7 +12,7 @@ metadata is stored in RDB and later exposed through a read-only Lambda API.
 | `frontend/` | Static pages: upload form (`index.html`, `app.js`) and image search (`search.html`, `search.js`), sharing `styles.css` |
 | `lambda/` | Capture service: validates metadata, writes a DB row, returns a pre-signed S3 PUT URL |
 | `query/` | Read-only Flask API over the `images` table (`GET /images`, `GET /image`) |
-| `templates/` | CloudFormation stacks for the storage layer and the running services |
+| `templates/` | CloudFormation stacks: the network (VPC), the storage layer draft, and the running services |
 
 ## Architecture
 
@@ -127,7 +127,18 @@ applied after ranking. Tune the threshold per request with `fuzzyThreshold`
 
 ### Infrastructure (`templates/`)
 
-`ImageServiceInfrastructrure.yaml` is the deployed stack. It provisions the
+`ImageVPC.yaml` is the network layer and is deployed first. It creates a
+`10.0.0.0/16` VPC with DNS hostnames and support enabled, an internet gateway,
+a NAT gateway (with an Elastic IP) for outbound traffic, public and private
+route tables with their routes and subnet associations, and three subnets: a
+public subnet (`10.0.0.0/24`) and a private subnet (`10.0.1.0/24`) in the
+region's first availability zone, plus a second public subnet (`10.0.2.0/24`)
+in the second availability zone so the load balancer has subnets in two AZs.
+It exports `VpcId`, `PrivateSubnet`, and `PublicSubnetIds`, which supply the
+query network parameters. Deploy it once with `./deploy.sh vpc` before the
+first `all` or `query` deploy.
+
+`ImageServiceInfrastructrure.yaml` is the deployed service stack. It provisions the
 frontend S3 bucket plus origin access control, the Lambda and its Function URL,
 the CloudFront distribution and routing rules, and the query tier (security
 groups, EC2 instance, ALB, target group, listener). Key resources are exposed
@@ -139,22 +150,24 @@ as stack outputs (`FrontendURL`, `CaptureEndpoint`, `QueryAlbDnsName`,
 
 ## Deployment
 
-`deploy.sh` builds the artifacts, deploys `templates/ImageServiceInfrastructrure.yaml`,
-and publishes the frontend. The stage argument selects how much of that it does:
+`deploy.sh` deploys the network stack, builds the artifacts, deploys
+`templates/ImageServiceInfrastructrure.yaml`, and publishes the frontend. The
+stage argument selects how much of that it does:
 
 | Stage | Builds | Deploys stack | Syncs frontend |
 | --- | --- | --- | --- |
-| `all` (default) | capture + query | yes | yes |
-| `lambda` | capture | yes | no |
-| `query` | query | yes | no |
+| `vpc` | nothing | network | no |
+| `all` (default) | capture + query | service | yes |
+| `lambda` | capture | service | no |
+| `query` | query | service | no |
 | `frontend` | nothing | no | yes |
 
 ```bash
-# Everything: capture Lambda, query tier, and frontend
-DB_HOST=<rds-endpoint> DB_PASSWORD=<password> \
-  QUERY_VPC_ID=<vpc> QUERY_SUBNET_ID=<subnet> \
-  ALB_SUBNET_IDS=<subnet-a>,<subnet-b> \
-  ./deploy.sh all
+# First setup: create the network stack the service stack depends on
+./deploy.sh vpc
+
+# Everything else: capture Lambda, query tier, and frontend
+DB_HOST=<rds-endpoint> DB_PASSWORD=<password> ./deploy.sh all
 
 # Just the capture Lambda after editing lambda_function.py
 DB_HOST=<rds-endpoint> DB_PASSWORD=<password> ./deploy.sh lambda
@@ -163,10 +176,14 @@ DB_HOST=<rds-endpoint> DB_PASSWORD=<password> ./deploy.sh lambda
 ./deploy.sh frontend
 ```
 
-`DB_HOST`, `DB_PASSWORD`, `QUERY_VPC_ID`, `QUERY_SUBNET_ID`, and `ALB_SUBNET_IDS`
-are required for the stages that touch the query tier. A stage that finds no
-existing stack is upgraded to a cold start, which builds both artifacts and
-requires all five, because the VPC and subnet parameters have no defaults.
+`DB_HOST` and `DB_PASSWORD` are required for the stages that touch the query
+tier. `QUERY_VPC_ID`, `QUERY_SUBNET_ID`, and `ALB_SUBNET_IDS` are read from the
+network stack outputs (`VpcId`, `PrivateSubnet`, `PublicSubnetIds`) when they are
+not set in the environment; an environment value wins over the stack output. If
+the network stack does not exist and the variables are unset, the script stops
+and tells you to run `./deploy.sh vpc` first. A stage that finds no existing
+service stack is upgraded to a cold start, which builds both artifacts and
+resolves the network the same way.
 
 Artifacts are uploaded under content addressed keys (`capture-<hash>.zip`,
 `query-<hash>.zip`) derived from the source files. That is what makes a
@@ -176,8 +193,9 @@ it installs the new code. Replacing that instance leaves the query routes
 unhealthy for a few minutes while it bootstraps, so the script waits for
 `/health` afterwards (set `SKIP_HEALTH_WAIT=1` to skip).
 
-`AWS_REGION`, `STACK_NAME`, `ARTIFACT_BUCKET`, `LAMBDA_CODE_KEY`,
-`QUERY_CODE_KEY`, and other overrides are documented at the top of `deploy.sh`.
+`AWS_REGION`, `STACK_NAME`, `VPC_STACK_NAME`, `ARTIFACT_BUCKET`,
+`LAMBDA_CODE_KEY`, `QUERY_CODE_KEY`, and other overrides are documented at the
+top of `deploy.sh`.
 
 ## Database Definition
 

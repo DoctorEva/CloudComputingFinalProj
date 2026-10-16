@@ -91,6 +91,21 @@ Resources:
         - Key: Name
           Value: Image Public Subnet
 
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Image Public Subnet 2
+
   PrivateSubnet:
     Type: AWS::EC2::Subnet
     DependsOn: VPC
@@ -124,6 +139,15 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable
       SubnetId: !Ref PrivateSubnet
 
+  PublicRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - PublicRouteTable
+      - PublicSubnet2
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
 Outputs:
   PublicSubnet:
     Description: The subnet ID to use for public web servers
@@ -139,3 +163,22 @@ Outputs:
     Export:
       Name:
         'Fn::Sub': '${AWS::StackName}-VpcID'
+
+  PublicSubnetIds:
+    Description: Comma separated public subnet IDs for the load balancer
+    Value:
+      'Fn::Join':
+        - ','
+        - - Ref: PublicSubnet
+          - Ref: PublicSubnet2
+    Export:
+      Name:
+        'Fn::Sub': '${AWS::StackName}-PublicSubnetIDs'
+
+  PrivateSubnet:
+    Description: The private subnet ID for the query instance
+    Value:
+      Ref: PrivateSubnet
+    Export:
+      Name:
+        'Fn::Sub': '${AWS::StackName}-PrivateSubnetID'

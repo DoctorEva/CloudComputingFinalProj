@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Builds the capture Lambda and query service artifacts, deploys the service
-# stack, and publishes the static frontend. Everything is driven by environment
-# variables so the script works unchanged against different accounts and
-# regions.
+# Deploys the network stack, builds the capture Lambda and query service
+# artifacts, deploys the service stack, and publishes the static frontend.
+# Everything is driven by environment variables so the script works unchanged
+# against different accounts and regions.
 #
-#   ./deploy.sh [all|lambda|query|frontend]      stage defaults to all
+#   ./deploy.sh [all|vpc|lambda|query|frontend]  stage defaults to all
 #
+#   vpc       deploy the network stack (VPC, subnets, gateways), no artifacts
 #   all       build both artifacts, deploy the stack, sync the frontend
 #   lambda    build the capture artifact, deploy the Lambda side of the stack
 #   query     build the query artifact, deploy the EC2/ALB side of the stack
@@ -14,15 +15,18 @@
 #
 # Required, by stage:
 #
-#   all, query   DB_HOST, DB_PASSWORD, QUERY_VPC_ID, QUERY_SUBNET_ID,
-#                ALB_SUBNET_IDS
+#   vpc          none
+#   all, query   DB_HOST, DB_PASSWORD, and the query network (see below)
 #   lambda       DB_HOST, DB_PASSWORD
 #   frontend     none; the stack must already exist
 #
-# A stage that finds no existing stack is upgraded to a cold start: it requires
-# the full set above and builds both artifacts, because QueryVpcId,
-# QuerySubnetId and AlbSubnetIds have no template defaults and the stack cannot
-# be created without them.
+# The query network (QUERY_VPC_ID, QUERY_SUBNET_ID, ALB_SUBNET_IDS) is read from
+# the network stack outputs when those variables are not set in the environment,
+# so run './deploy.sh vpc' once before the first all/query deploy. Environment
+# values override the stack outputs. A stage that finds no existing service
+# stack is upgraded to a cold start: it builds both artifacts and resolves the
+# query network the same way, because QueryVpcId, QuerySubnetId and AlbSubnetIds
+# have no template defaults and the stack cannot be created without them.
 #
 # Optional:
 #
@@ -38,6 +42,7 @@
 #   CLOUDFRONT_PREFIX_LIST_ID    default empty (falls back to 0.0.0.0/0 on port 80)
 #   FRONTEND_BUCKET_NAME         default empty (generated from account and region)
 #   STACK_NAME                   default image-capture-service
+#   VPC_STACK_NAME               default image-vpc
 #   ARTIFACT_BUCKET              default image-capture-artifacts-<account-id>
 #   AWS_REGION                   default us-east-1
 #   AWS_PROFILE                  default empty (ambient credentials)
@@ -61,6 +66,7 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
 STACK_NAME="${STACK_NAME:-image-capture-service}"
+VPC_STACK_NAME="${VPC_STACK_NAME:-image-vpc}"
 IMAGE_BUCKET_NAME="${IMAGE_BUCKET_NAME:-image-bucket}"
 DB_NAME="${DB_NAME:-image-metadata}"
 DB_PORT="${DB_PORT:-3306}"
@@ -77,6 +83,7 @@ STAGE="${1:-all}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${ROOT}/templates/ImageServiceInfrastructrure.yaml"
+VPC_TEMPLATE="${ROOT}/templates/ImageVPC.yaml"
 BUILD_DIR="${ROOT}/build"
 
 AWS=()
@@ -92,9 +99,9 @@ fi
 AWS+=(--region "${REGION}")
 
 case "${STAGE}" in
-  all|lambda|query|frontend) ;;
+  all|vpc|lambda|query|frontend) ;;
   *)
-    echo "usage: $(basename "$0") [all|lambda|query|frontend]" >&2
+    echo "usage: $(basename "$0") [all|vpc|lambda|query|frontend]" >&2
     exit 2
     ;;
 esac
@@ -141,31 +148,40 @@ add_optional_param() {
 }
 
 stack_exists() {
-  "${AWS[@]}" cloudformation describe-stacks --stack-name "${STACK_NAME}" >/dev/null 2>&1
+  "${AWS[@]}" cloudformation describe-stacks --stack-name "${1:-${STACK_NAME}}" >/dev/null 2>&1
 }
 
-output() {
+stack_output() {
   "${AWS[@]}" cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" \
-    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
+    --stack-name "$1" \
+    --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" \
     --output text
 }
 
+output() {
+  stack_output "${STACK_NAME}" "$1"
+}
+
 COLD_START=0
-if [[ "${STAGE}" == frontend ]]; then
-  if ! stack_exists; then
-    echo "stack ${STACK_NAME} does not exist; run './deploy.sh all' first" >&2
-    exit 1
+if [[ "${STAGE}" != vpc ]]; then
+  if [[ "${STAGE}" == frontend ]]; then
+    if ! stack_exists; then
+      echo "stack ${STACK_NAME} does not exist; run './deploy.sh all' first" >&2
+      exit 1
+    fi
+  elif ! stack_exists; then
+    COLD_START=1
+    echo ">> stack ${STACK_NAME} does not exist; this is a cold start, building and deploying everything"
   fi
-elif ! stack_exists; then
-  COLD_START=1
-  echo ">> stack ${STACK_NAME} does not exist; this is a cold start, building and deploying everything"
 fi
 
 BUILD_LAMBDA=0
 BUILD_QUERY=0
 DEPLOY_QUERY_PARAMS=0
-if [[ "${STAGE}" == all || "${COLD_START}" == 1 ]]; then
+DEPLOY_VPC=0
+if [[ "${STAGE}" == vpc ]]; then
+  DEPLOY_VPC=1
+elif [[ "${STAGE}" == all || "${COLD_START}" == 1 ]]; then
   BUILD_LAMBDA=1
   BUILD_QUERY=1
   DEPLOY_QUERY_PARAMS=1
@@ -180,7 +196,7 @@ if [[ "${BUILD_LAMBDA}" == 1 || "${BUILD_QUERY}" == 1 ]]; then
   require_cmd zip
   require_cmd python3
 fi
-if [[ "${STAGE}" != frontend ]] && ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]] && ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   echo "sha256sum or shasum is required" >&2
   exit 1
 fi
@@ -198,27 +214,47 @@ require_sources() {
   done
 }
 
+resolve_query_network() {
+  if [[ -z "${QUERY_VPC_ID:-}" || -z "${QUERY_SUBNET_ID:-}" || -z "${ALB_SUBNET_IDS:-}" ]] \
+    && ! stack_exists "${VPC_STACK_NAME}"; then
+    echo "query network parameters are missing and stack ${VPC_STACK_NAME} does not exist" >&2
+    echo "run './deploy.sh vpc' first, or set QUERY_VPC_ID, QUERY_SUBNET_ID and ALB_SUBNET_IDS" >&2
+    exit 1
+  fi
+  if [[ -z "${QUERY_VPC_ID:-}" ]]; then
+    QUERY_VPC_ID="$(stack_output "${VPC_STACK_NAME}" VpcId)"
+  fi
+  if [[ -z "${QUERY_SUBNET_ID:-}" ]]; then
+    QUERY_SUBNET_ID="$(stack_output "${VPC_STACK_NAME}" PrivateSubnet)"
+  fi
+  if [[ -z "${ALB_SUBNET_IDS:-}" ]]; then
+    ALB_SUBNET_IDS="$(stack_output "${VPC_STACK_NAME}" PublicSubnetIds)"
+  fi
+  if [[ -z "${QUERY_VPC_ID:-}" || -z "${QUERY_SUBNET_ID:-}" || -z "${ALB_SUBNET_IDS:-}" ]]; then
+    echo "could not resolve the query network from stack ${VPC_STACK_NAME}" >&2
+    echo "set QUERY_VPC_ID, QUERY_SUBNET_ID and ALB_SUBNET_IDS explicitly" >&2
+    exit 1
+  fi
+  echo ">> query network: vpc ${QUERY_VPC_ID}, subnet ${QUERY_SUBNET_ID}, alb subnets ${ALB_SUBNET_IDS}"
+}
+
 if [[ "${STAGE}" == all || "${STAGE}" == query ]]; then
   require DB_HOST "e.g. image-metadata.abc123.us-east-1.rds.amazonaws.com"
   require DB_PASSWORD
-  require QUERY_VPC_ID
-  require QUERY_SUBNET_ID
-  require ALB_SUBNET_IDS "comma separated public subnet ids, at least two"
+  resolve_query_network
 elif [[ "${STAGE}" == lambda ]]; then
   require DB_HOST "e.g. image-metadata.abc123.us-east-1.rds.amazonaws.com"
   require DB_PASSWORD
 fi
 
 if [[ "${COLD_START}" == 1 ]]; then
-  require QUERY_VPC_ID
-  require QUERY_SUBNET_ID
-  require ALB_SUBNET_IDS "comma separated public subnet ids, at least two"
+  resolve_query_network
 fi
 
 LAMBDA_CODE_KEY="${LAMBDA_CODE_KEY:-}"
 QUERY_CODE_KEY="${QUERY_CODE_KEY:-}"
 
-if [[ "${STAGE}" != frontend ]]; then
+if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]]; then
   require_sources "${LAMBDA_SOURCES[@]}"
   if [[ -z "${LAMBDA_CODE_KEY}" ]]; then
     LAMBDA_CODE_KEY="capture-$(hash_of "${LAMBDA_SOURCES[@]}").zip"
@@ -238,7 +274,7 @@ if [[ -z "${ARTIFACT_BUCKET:-}" ]]; then
 fi
 
 PREVIOUS_INSTANCE_ID=""
-if [[ "${STAGE}" != frontend && "${COLD_START}" == 0 ]]; then
+if [[ "${STAGE}" != frontend && "${STAGE}" != vpc && "${COLD_START}" == 0 ]]; then
   PREVIOUS_INSTANCE_ID="$(output QueryInstanceId)"
 fi
 
@@ -320,7 +356,18 @@ if [[ "${BUILD_LAMBDA}" == 1 || "${BUILD_QUERY}" == 1 ]]; then
   fi
 fi
 
-if [[ "${STAGE}" != frontend ]]; then
+if [[ "${DEPLOY_VPC}" == 1 ]]; then
+  echo ">> validating ${VPC_TEMPLATE}"
+  "${AWS[@]}" cloudformation validate-template --template-body "file://${VPC_TEMPLATE}" >/dev/null
+
+  echo ">> deploying stack ${VPC_STACK_NAME}"
+  "${AWS[@]}" cloudformation deploy \
+    --template-file "${VPC_TEMPLATE}" \
+    --stack-name "${VPC_STACK_NAME}" \
+    --no-fail-on-empty-changeset
+fi
+
+if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]]; then
   PARAMS=()
   add_param LambdaCodeBucket "${ARTIFACT_BUCKET}"
   add_param LambdaCodeKey "${LAMBDA_CODE_KEY}"
@@ -360,7 +407,7 @@ if [[ "${STAGE}" == all || "${STAGE}" == frontend ]]; then
   sync_frontend
 fi
 
-if [[ "${STAGE}" != frontend ]]; then
+if [[ "${STAGE}" != frontend && "${STAGE}" != vpc ]]; then
   INSTANCE_ID="$(output QueryInstanceId)"
   if [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "${PREVIOUS_INSTANCE_ID}" ]]; then
     if [[ "${SKIP_HEALTH_WAIT:-0}" != 1 ]]; then
@@ -370,12 +417,18 @@ if [[ "${STAGE}" != frontend ]]; then
 fi
 
 echo ">> done"
-echo "   frontend : $(output FrontendURL)"
-echo "   bucket   : $(output FrontendBucketName)"
-echo "   capture  : $(output CaptureEndpoint)"
-if [[ "${DEPLOY_QUERY_PARAMS}" == 1 || "${STAGE}" == frontend ]]; then
-  echo "   alb      : $(output QueryAlbDnsName)"
-  echo "   listing  : $(output QueryImagesEndpoint)"
-  echo "   image    : $(output QueryImageEndpoint)"
-  echo "   instance : $(output QueryInstanceId)"
+if [[ "${STAGE}" == vpc ]]; then
+  echo "   vpc      : $(stack_output "${VPC_STACK_NAME}" VpcId)"
+  echo "   subnets  : $(stack_output "${VPC_STACK_NAME}" PublicSubnetIds)"
+  echo "   private  : $(stack_output "${VPC_STACK_NAME}" PrivateSubnet)"
+else
+  echo "   frontend : $(output FrontendURL)"
+  echo "   bucket   : $(output FrontendBucketName)"
+  echo "   capture  : $(output CaptureEndpoint)"
+  if [[ "${DEPLOY_QUERY_PARAMS}" == 1 || "${STAGE}" == frontend ]]; then
+    echo "   alb      : $(output QueryAlbDnsName)"
+    echo "   listing  : $(output QueryImagesEndpoint)"
+    echo "   image    : $(output QueryImageEndpoint)"
+    echo "   instance : $(output QueryInstanceId)"
+  fi
 fi
