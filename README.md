@@ -35,7 +35,7 @@ flowchart LR
     end
 
     subgraph Data["Data layer (persistence stack)"]
-        ImageBucket["S3 image bucket<br/>region-img-collect-bucket"]
+        ImageBucket["S3 image bucket<br/>region-img-collect-bucket-account"]
         RDS["RDS MySQL :3306<br/>images table"]
     end
 
@@ -148,20 +148,25 @@ Deploy it once with `./deploy.sh vpc` before the first persistence, `all`,
 `ImageServiceInfrastructrure.yaml` is the deployed service stack. It provisions the
 frontend S3 bucket plus origin access control, the Lambda and its Function URL,
 the CloudFront distribution and routing rules, and the query tier (security
-groups, EC2 instance, ALB, target group, listener). It imports the persistence
-stack exports for the image bucket, database host and database name, attaches
-the capture Lambda to the private subnets, and adds database ingress from the
-query instance and Lambda security groups. Key resources are exposed as stack
-outputs (`FrontendURL`, `CaptureEndpoint`, `QueryAlbDnsName`,
-`QueryImagesEndpoint`, and others).
+groups, EC2 instance, ALB, target group, listener). It also creates the IAM
+role assumed by the capture Lambda (write access to the image bucket plus the
+VPC access it needs to reach RDS and publish logs) and the IAM role and
+instance profile for the query instance (read access to the image and artifact
+buckets plus SSM for administrative access). It imports the persistence stack
+exports for the image bucket, database host and database name, attaches the
+capture Lambda to the private subnets, and adds database ingress from the query
+instance and Lambda security groups. Key resources are exposed as stack outputs
+(`FrontendURL`, `CaptureEndpoint`, `QueryAlbDnsName`, `QueryImagesEndpoint`, and
+others).
 
 `ImagePersistanceInfrastructrure.yaml` is the data layer and is deployed by the
 `persistence` stage. It creates the image S3 bucket
-(`${AWS::Region}-img-collect-bucket` unless overridden), an RDS MySQL instance in
+(`${AWS::Region}-img-collect-bucket-${AWS::AccountId}` unless overridden), an RDS MySQL instance in
 the private subnets (with a DB subnet group), and the security group attached to
 the instance. Database credentials are stack parameters, not secrets stored in
-the stack. It exports `BucketName`, `DBHost`, `DBName` and `DBSecurityGroupId`
-(export names `photogrammetry-image-bucket`, `photogrammetry-db-host`,
+the stack. It exports `BucketName`, `BucketArn`, `DBHost`, `DBName` and
+`DBSecurityGroupId` (export names `photogrammetry-image-bucket`,
+`photogrammetry-image-bucket-arn`, `photogrammetry-db-host`,
 `photogrammetry-db-name`, `photogrammetry-db-security-group-id`), which the
 service stack imports, so deploy it before the service stack.
 
@@ -210,6 +215,11 @@ artifacts, and resolves the network the same way. The service stack imports the
 persistence stack exports, so `lambda` and `query` require the persistence stack
 to already exist.
 
+Both S3 buckets are created with `DeletionPolicy: Retain`, so deleting or rolling
+back a stack can leave them behind. A later deploy then fails with
+`... already exists`; delete the leftover bucket or set `IMAGE_BUCKET_NAME` or
+`FRONTEND_BUCKET_NAME` to a name that is not in use.
+
 Artifacts are uploaded under content addressed keys (`capture-<hash>.zip`,
 `query-<hash>.zip`) derived from the source files. That is what makes a
 redeploy take effect: a changed key changes the Lambda code reference and the
@@ -243,6 +253,6 @@ CREATE TABLE images (
     `pitch` DECIMAL(6,2) DEFAULT NULL,
     `roll` DECIMAL(6,2) DEFAULT NULL,
     `createDt` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (`s3url`),
-  )
+    PRIMARY KEY (`s3url`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```

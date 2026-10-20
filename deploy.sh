@@ -39,10 +39,8 @@
 #   DB_PORT                      default 3306
 #   DB_INSTANCE_CLASS            default db.t3.micro
 #   DB_ALLOCATED_STORAGE         default 20
-#   IMAGE_BUCKET_NAME            default empty (persistence derives <region>-img-collect-bucket)
-#   LAMBDA_ROLE_NAME             default LabRole
+#   IMAGE_BUCKET_NAME            default empty (persistence derives <region>-img-collect-bucket-<account-id>)
 #   QUERY_INSTANCE_TYPE          default t3.micro
-#   QUERY_INSTANCE_PROFILE_NAME  default LabInstanceProfile
 #   QUERY_KEY_NAME               default empty (no SSH key)
 #   CLOUDFRONT_PREFIX_LIST_ID    default empty (falls back to 0.0.0.0/0 on port 80)
 #   FRONTEND_BUCKET_NAME         default empty (generated from account and region)
@@ -80,9 +78,7 @@ DB_PORT="${DB_PORT:-3306}"
 DB_USER="${DB_USER:-admin}"
 DB_INSTANCE_CLASS="${DB_INSTANCE_CLASS:-db.t3.micro}"
 DB_ALLOCATED_STORAGE="${DB_ALLOCATED_STORAGE:-20}"
-LAMBDA_ROLE_NAME="${LAMBDA_ROLE_NAME:-LabRole}"
 QUERY_INSTANCE_TYPE="${QUERY_INSTANCE_TYPE:-t3.micro}"
-QUERY_INSTANCE_PROFILE_NAME="${QUERY_INSTANCE_PROFILE_NAME:-LabInstanceProfile}"
 QUERY_KEY_NAME="${QUERY_KEY_NAME:-}"
 CLOUDFRONT_PREFIX_LIST_ID="${CLOUDFRONT_PREFIX_LIST_ID:-}"
 FRONTEND_BUCKET_NAME="${FRONTEND_BUCKET_NAME:-}"
@@ -381,13 +377,11 @@ if [[ "${BUILD_LAMBDA}" == 1 || "${BUILD_QUERY}" == 1 ]]; then
 fi
 
 if [[ "${DEPLOY_VPC}" == 1 ]]; then
-  echo ">> validating ${VPC_TEMPLATE}"
-  "${AWS[@]}" cloudformation validate-template --template-body "file://${VPC_TEMPLATE}" >/dev/null
-
   echo ">> deploying stack ${VPC_STACK_NAME}"
   "${AWS[@]}" cloudformation deploy \
     --template-file "${VPC_TEMPLATE}" \
     --stack-name "${VPC_STACK_NAME}" \
+    --capabilities CAPABILITY_NAMED_IAM \
     --no-fail-on-empty-changeset
 fi
 
@@ -402,13 +396,11 @@ if [[ "${DEPLOY_PERSISTENCE}" == 1 ]]; then
   add_param DbAllocatedStorage "${DB_ALLOCATED_STORAGE}"
   add_param ImageBucketName "${IMAGE_BUCKET_NAME}"
 
-  echo ">> validating ${PERSISTENCE_TEMPLATE}"
-  "${AWS[@]}" cloudformation validate-template --template-body "file://${PERSISTENCE_TEMPLATE}" >/dev/null
-
   echo ">> deploying stack ${PERSISTENCE_STACK_NAME}"
   "${AWS[@]}" cloudformation deploy \
     --template-file "${PERSISTENCE_TEMPLATE}" \
     --stack-name "${PERSISTENCE_STACK_NAME}" \
+    --capabilities CAPABILITY_NAMED_IAM \
     --no-fail-on-empty-changeset \
     --parameter-overrides "${PARAMS[@]}"
 fi
@@ -417,7 +409,6 @@ if [[ "${SERVICE_STAGE}" == 1 ]]; then
   PARAMS=()
   add_param LambdaCodeBucket "${ARTIFACT_BUCKET}"
   add_param LambdaCodeKey "${LAMBDA_CODE_KEY}"
-  add_param LambdaRoleName "${LAMBDA_ROLE_NAME}"
   add_param DbPort "${DB_PORT}"
   add_param DbUser "${DB_USER}"
   add_param DbPassword "${DB_PASSWORD:-}"
@@ -427,7 +418,6 @@ if [[ "${SERVICE_STAGE}" == 1 ]]; then
   if [[ "${DEPLOY_QUERY_PARAMS}" == 1 ]]; then
     add_param QueryCodeKey "${QUERY_CODE_KEY}"
     add_param QueryInstanceType "${QUERY_INSTANCE_TYPE}"
-    add_param QueryInstanceProfileName "${QUERY_INSTANCE_PROFILE_NAME}"
     add_param QueryVpcId "${QUERY_VPC_ID:-}"
     add_param QuerySubnetId "${QUERY_SUBNET_ID:-}"
     add_param AlbSubnetIds "${ALB_SUBNET_IDS:-}"
@@ -435,13 +425,11 @@ if [[ "${SERVICE_STAGE}" == 1 ]]; then
     add_optional_param CloudFrontPrefixListId "${CLOUDFRONT_PREFIX_LIST_ID}"
   fi
 
-  echo ">> validating ${TEMPLATE}"
-  "${AWS[@]}" cloudformation validate-template --template-body "file://${TEMPLATE}" >/dev/null
-
   echo ">> deploying stack ${STACK_NAME}"
   "${AWS[@]}" cloudformation deploy \
     --template-file "${TEMPLATE}" \
     --stack-name "${STACK_NAME}" \
+    --capabilities CAPABILITY_NAMED_IAM \
     --no-fail-on-empty-changeset \
     --parameter-overrides "${PARAMS[@]}"
 fi

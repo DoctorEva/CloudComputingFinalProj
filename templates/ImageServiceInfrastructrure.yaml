@@ -6,8 +6,10 @@ Description: >
   Function URL on POST /api/images, and a CloudFront distribution that serves
   the static frontend from S3 and proxies /api/* through to the function URL.
   Also provisions the read-only query service (Flask on EC2 behind an ALB).
-  DB credentials are supplied as stack parameters; no IAM or Secrets Manager
-  resources are created by this stack.
+  DB credentials are supplied as stack parameters. The stack creates the IAM
+  execution role for the capture Lambda and the IAM role and instance profile
+  for the query instance, scoped to the S3 and operational permissions the
+  workloads use.
 
 
 Parameters:
@@ -40,13 +42,6 @@ Parameters:
   LambdaHandler:
     Type: String
     Default: lambda_function.lambda_handler
-
-  LambdaRoleName:
-    Type: String
-    Default: LabRole
-    Description: >
-      Name of an existing IAM role the capture function assumes. The learner lab
-      provides LabRole; no IAM resources are created by this stack.
 
   CaptureTimeout:
     Type: Number
@@ -111,13 +106,6 @@ Parameters:
   QueryInstanceType:
     Type: String
     Default: t3.micro
-
-  QueryInstanceProfileName:
-    Type: String
-    Default: LabInstanceProfile
-    Description: >
-      Name of an existing EC2 instance profile granting S3 and SSM access. The
-      learner lab provides LabInstanceProfile; no IAM resources are created.
 
   QueryKeyName:
     Type: String
@@ -194,6 +182,30 @@ Resources:
   # Capture Lambda
   # ===========================================================================
 
+  CaptureFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-capture-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: ImageBucketUpload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - '${BucketArn}/*'
+                  - BucketArn: !ImportValue photogrammetry-image-bucket-arn
+
   CaptureFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -203,7 +215,7 @@ Resources:
         client to upload the image directly to the image bucket.
       Runtime: !Ref LambdaRuntime
       Handler: !Ref LambdaHandler
-      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaRoleName}'
+      Role: !GetAtt CaptureFunctionRole.Arn
       Timeout: !Ref CaptureTimeout
       MemorySize: !Ref CaptureMemory
       Code:
@@ -239,6 +251,27 @@ Resources:
         AllowHeaders:
           - content-type
         MaxAge: 3600
+
+  # A function URL with AuthType NONE is only reachable when the function's
+  # resource-based policy grants both actions. CloudFormation does not create
+  # this policy for us, and without it every request returns 403.
+  CaptureFunctionUrlInvokeUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: CaptureFunctionUrl
+    Properties:
+      FunctionName: !Ref CaptureFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  CaptureFunctionUrlInvokeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: CaptureFunctionUrl
+    Properties:
+      FunctionName: !Ref CaptureFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
 
   # ===========================================================================
   # Query service: Flask API on a private EC2 instance behind an ALB
@@ -310,12 +343,47 @@ Resources:
       SourceSecurityGroupId: !Ref CaptureFunctionSecurityGroup
       Description: MySQL from the capture Lambda.
 
+  QueryInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-query-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ReadImagesAndArtifacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue photogrammetry-image-bucket-arn
+                  - !Sub
+                    - 'arn:${AWS::Partition}:s3:::${CodeBucket}/*'
+                    - CodeBucket: !Ref LambdaCodeBucket
+
+  QueryInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-query-profile'
+      Roles:
+        - !Ref QueryInstanceRole
+
   QueryInstance:
     Type: AWS::EC2::Instance
     Properties:
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref QueryInstanceType
-      IamInstanceProfile: !Ref QueryInstanceProfileName
+      IamInstanceProfile: !Ref QueryInstanceProfile
       SubnetId: !Ref QuerySubnetId
       KeyName: !If [HasQueryKeyName, !Ref QueryKeyName, !Ref 'AWS::NoValue']
       SecurityGroupIds:

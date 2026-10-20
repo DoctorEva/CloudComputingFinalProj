@@ -26,7 +26,7 @@ Parameters:
     Default: ''
     Description: >
       Globally unique, lowercase name for the image bucket. Leave empty to
-      derive it from the region.
+      derive it from the region and account id.
 
   DbName:
     Type: String
@@ -68,7 +68,20 @@ Resources:
       BucketName: !If
         - HasImageBucketName
         - !Ref ImageBucketName
-        - !Sub '${AWS::Region}-img-collect-bucket'
+        - !Sub '${AWS::Region}-img-collect-bucket-${AWS::AccountId}'
+      # The browser PUTs to a pre-signed URL, so the bucket needs a CORS rule
+      # for the cross-origin request from the CloudFront frontend.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - PUT
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
 
   ImgCollectDBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
@@ -109,6 +122,12 @@ Outputs:
       Ref: ImgCollectBucket
     Export:
       Name: photogrammetry-image-bucket
+
+  BucketArn:
+    Description: ARN of the bucket that stores image bytes.
+    Value: !GetAtt ImgCollectBucket.Arn
+    Export:
+      Name: photogrammetry-image-bucket-arn
 
   DBHost:
     Description: RDS endpoint hostname for the image metadata database.
