@@ -1,36 +1,42 @@
 #!/usr/bin/env bash
 #
 # Deploys the network stack, the persistence stack, builds the capture Lambda
-# and query service artifacts, deploys the service stack, and publishes the
-# static frontend. Everything is driven by environment variables so the script
-# works unchanged against different accounts and regions.
+# and query service artifacts, deploys the service stack, applies the database
+# schema, and publishes the static frontend. Everything is driven by
+# environment variables so the script works unchanged against different
+# accounts and regions.
 #
-#   ./deploy.sh [all|vpc|persistence|lambda|query|frontend]  defaults to all
+#   ./deploy.sh [all|vpc|persistence|lambda|query|frontend|schema]  defaults to all
 #
 #   vpc          deploy the network stack (VPC, subnets, gateways), no artifacts
 #   persistence  deploy the data layer (image bucket, RDS, DB security group)
-#   all          deploy persistence, build both artifacts, deploy the stack,
-#                sync the frontend
+#   all          deploy the network stack, then persistence, build both
+#                artifacts, deploy the stack, sync the frontend
 #   lambda       build the capture artifact, deploy the Lambda side of the stack
 #   query        build the query artifact, deploy the EC2/ALB side of the stack
 #   frontend     sync frontend/ and invalidate CloudFront, no stack update
+#   schema       apply db/schema.sql to the metadata database, no stack update
 #
 # Required, by stage:
 #
 #   vpc               none
 #   persistence       DB_PASSWORD, and the network (see below)
-#   all, query        DB_PASSWORD, and the network (see below)
+#   all               DB_PASSWORD; deploys the network stack itself
+#   query             DB_PASSWORD, and the network (see below)
 #   lambda            DB_PASSWORD, and the network (see below)
 #   frontend          none; the stack must already exist
+#   schema            none; the stack must already exist
 #
 # The network (QUERY_VPC_ID, QUERY_SUBNET_ID, ALB_SUBNET_IDS and
 # PRIVATE_SUBNET_IDS) is read from the network stack outputs when those
-# variables are not set in the environment, so run './deploy.sh vpc' once before
-# the first persistence/all/query/lambda deploy. Environment values override the
-# stack outputs. A stage that finds no existing service stack is upgraded to a
-# cold start: it builds both artifacts and resolves the network the same way,
-# because QueryVpcId, QuerySubnetId, AlbSubnetIds and LambdaSubnetIds have no
-# template defaults and the stack cannot be created without them.
+# variables are not set in the environment. The 'all' stage deploys the network
+# stack first, so it works on a clean account. The other stages need it to exist
+# already: run './deploy.sh vpc' once before the first persistence, query, or
+# lambda deploy. Environment values override the stack outputs. A stage that
+# finds no existing service stack is upgraded to a cold start: it builds both
+# artifacts and resolves the network the same way, because QueryVpcId,
+# QuerySubnetId, AlbSubnetIds and LambdaSubnetIds have no template defaults and
+# the stack cannot be created without them.
 #
 # Optional:
 #
@@ -53,6 +59,8 @@
 #   CLEAR_OPTIONAL               1 sends the sticky parameters below as empty
 #   SKIP_HEALTH_WAIT             1 skips waiting for a replaced query instance
 #   QUERY_HEALTH_TIMEOUT         default 300 seconds
+#   SKIP_SCHEMA_INIT             1 skips applying db/schema.sql
+#   SSM_WAIT_TIMEOUT             default 300 seconds waiting on SSM
 #
 # Artifact keys are content addressed (capture-<hash>.zip, query-<hash>.zip).
 # Changing a source file changes the key, and that is what makes the deploy take
@@ -104,9 +112,9 @@ fi
 AWS+=(--region "${REGION}")
 
 case "${STAGE}" in
-  all|vpc|persistence|lambda|query|frontend) ;;
+  all|vpc|persistence|lambda|query|frontend|schema) ;;
   *)
-    echo "usage: $(basename "$0") [all|vpc|persistence|lambda|query|frontend]" >&2
+    echo "usage: $(basename "$0") [all|vpc|persistence|lambda|query|frontend|schema]" >&2
     exit 2
     ;;
 esac
@@ -169,7 +177,7 @@ output() {
 
 COLD_START=0
 if [[ "${STAGE}" != vpc && "${STAGE}" != persistence ]]; then
-  if [[ "${STAGE}" == frontend ]]; then
+  if [[ "${STAGE}" == frontend || "${STAGE}" == schema ]]; then
     if ! stack_exists; then
       echo "stack ${STACK_NAME} does not exist; run './deploy.sh all' first" >&2
       exit 1
@@ -185,11 +193,15 @@ BUILD_QUERY=0
 DEPLOY_QUERY_PARAMS=0
 DEPLOY_VPC=0
 DEPLOY_PERSISTENCE=0
+APPLY_SCHEMA=0
 if [[ "${STAGE}" == vpc ]]; then
   DEPLOY_VPC=1
 elif [[ "${STAGE}" == persistence ]]; then
   DEPLOY_PERSISTENCE=1
 elif [[ "${STAGE}" == all || "${COLD_START}" == 1 ]]; then
+  if [[ "${STAGE}" == all ]]; then
+    DEPLOY_VPC=1
+  fi
   BUILD_LAMBDA=1
   BUILD_QUERY=1
   DEPLOY_QUERY_PARAMS=1
@@ -202,13 +214,20 @@ elif [[ "${STAGE}" == query ]]; then
 fi
 
 SERVICE_STAGE=1
-if [[ "${STAGE}" == frontend || "${STAGE}" == vpc || "${STAGE}" == persistence ]]; then
+if [[ "${STAGE}" == frontend || "${STAGE}" == vpc || "${STAGE}" == persistence || "${STAGE}" == schema ]]; then
   SERVICE_STAGE=0
+fi
+
+if [[ "${SERVICE_STAGE}" == 1 || "${STAGE}" == schema ]]; then
+  APPLY_SCHEMA=1
 fi
 
 if [[ "${BUILD_LAMBDA}" == 1 || "${BUILD_QUERY}" == 1 ]]; then
   require_cmd zip
   require_cmd python3
+fi
+if [[ "${APPLY_SCHEMA}" == 1 ]]; then
+  require_cmd base64
 fi
 if [[ "${SERVICE_STAGE}" == 1 ]] && ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   echo "sha256sum or shasum is required" >&2
@@ -217,6 +236,9 @@ fi
 
 LAMBDA_SOURCES=("${ROOT}/lambda/lambda_function.py" "${ROOT}/lambda/requirements.txt")
 QUERY_SOURCES=("${ROOT}/query/app.py" "${ROOT}/query/requirements.txt")
+SCHEMA_SQL="${ROOT}/db/schema.sql"
+SCHEMA_RUNNER="${ROOT}/db/apply_schema.py"
+SCHEMA_SOURCES=("${SCHEMA_SQL}" "${SCHEMA_RUNNER}")
 
 require_sources() {
   local source_file
@@ -227,6 +249,10 @@ require_sources() {
     fi
   done
 }
+
+if [[ "${APPLY_SCHEMA}" == 1 ]]; then
+  require_sources "${SCHEMA_SOURCES[@]}"
+fi
 
 resolve_query_network() {
   if [[ -z "${QUERY_VPC_ID:-}" || -z "${QUERY_SUBNET_ID:-}" || -z "${ALB_SUBNET_IDS:-}" || -z "${PRIVATE_SUBNET_IDS:-}" ]] \
@@ -258,6 +284,18 @@ resolve_query_network() {
 
 if [[ "${STAGE}" == all || "${STAGE}" == query || "${STAGE}" == lambda || "${STAGE}" == persistence ]]; then
   require DB_PASSWORD
+fi
+
+if [[ "${DEPLOY_VPC}" == 1 ]]; then
+  echo ">> deploying stack ${VPC_STACK_NAME}"
+  "${AWS[@]}" cloudformation deploy \
+    --template-file "${VPC_TEMPLATE}" \
+    --stack-name "${VPC_STACK_NAME}" \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --no-fail-on-empty-changeset
+fi
+
+if [[ "${STAGE}" == all || "${STAGE}" == query || "${STAGE}" == lambda || "${STAGE}" == persistence ]]; then
   resolve_query_network
 fi
 
@@ -359,6 +397,100 @@ wait_for_query() {
   echo ">> warning: query instance was not healthy within ${QUERY_HEALTH_TIMEOUT:-300}s" >&2
 }
 
+wait_for_ssm() {
+  local instance_id="$1" deadline ping
+  deadline=$((SECONDS + ${SSM_WAIT_TIMEOUT:-300}))
+  echo ">> waiting for instance ${instance_id} to register with SSM"
+  while ((SECONDS < deadline)); do
+    ping="$("${AWS[@]}" ssm describe-instance-information \
+      --filters "Key=InstanceIds,Values=${instance_id}" \
+      --query 'InstanceInformationList[0].PingStatus' \
+      --output text 2>/dev/null || true)"
+    if [[ "${ping}" == "Online" ]]; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "instance ${instance_id} did not register with SSM within ${SSM_WAIT_TIMEOUT:-300}s" >&2
+  return 1
+}
+
+apply_schema() {
+  local instance_id sql_b64 runner_b64 request command_id status deadline
+  instance_id="$(output QueryInstanceId)"
+  if [[ -z "${instance_id}" ]]; then
+    echo ">> skipping schema init: stack ${STACK_NAME} has no query instance"
+    return 0
+  fi
+
+  wait_for_ssm "${instance_id}"
+
+  sql_b64="$(base64 < "${SCHEMA_SQL}" | tr -d '\n')"
+  runner_b64="$(base64 < "${SCHEMA_RUNNER}" | tr -d '\n')"
+  request="$(mktemp)"
+
+  cat > "${request}" <<JSON
+{
+  "DocumentName": "AWS-RunShellScript",
+  "InstanceIds": ["${instance_id}"],
+  "Comment": "apply images schema",
+  "Parameters": {
+    "commands": [
+      "echo ${sql_b64} | base64 -d > /tmp/photogrammetry-schema.sql",
+      "echo ${runner_b64} | base64 -d > /tmp/photogrammetry-apply-schema.py",
+      "test -x /opt/query/venv/bin/python || { echo 'query venv is not ready' >&2; exit 3; }",
+      "/opt/query/venv/bin/python /tmp/photogrammetry-apply-schema.py /tmp/photogrammetry-schema.sql",
+      "rm -f /tmp/photogrammetry-schema.sql /tmp/photogrammetry-apply-schema.py"
+    ]
+  }
+}
+JSON
+
+  echo ">> applying ${SCHEMA_SQL#${ROOT}/} to the metadata database"
+  if ! command_id="$("${AWS[@]}" ssm send-command --cli-input-json "file://${request}" --query 'Command.CommandId' --output text)"; then
+    rm -f "${request}"
+    return 1
+  fi
+  rm -f "${request}"
+
+  deadline=$((SECONDS + ${SSM_WAIT_TIMEOUT:-300}))
+  while ((SECONDS < deadline)); do
+    status="$("${AWS[@]}" ssm get-command-invocation \
+      --command-id "${command_id}" \
+      --instance-id "${instance_id}" \
+      --query 'Status' \
+      --output text 2>/dev/null || true)"
+    if [[ -z "${status}" ]]; then
+      sleep 3
+      continue
+    fi
+    case "${status}" in
+      Pending|InProgress|Delayed)
+        sleep 3
+        ;;
+      Success)
+        "${AWS[@]}" ssm get-command-invocation \
+          --command-id "${command_id}" \
+          --instance-id "${instance_id}" \
+          --query 'StandardOutputContent' \
+          --output text
+        return 0
+        ;;
+      *)
+        echo "schema init failed with status ${status}" >&2
+        "${AWS[@]}" ssm get-command-invocation \
+          --command-id "${command_id}" \
+          --instance-id "${instance_id}" \
+          --query 'StandardErrorContent' \
+          --output text >&2
+        return 1
+        ;;
+    esac
+  done
+  echo "schema init did not finish within ${SSM_WAIT_TIMEOUT:-300}s" >&2
+  return 1
+}
+
 if [[ "${BUILD_LAMBDA}" == 1 ]]; then
   build_lambda
 fi
@@ -447,6 +579,10 @@ if [[ "${SERVICE_STAGE}" == 1 ]]; then
   fi
 fi
 
+if [[ "${APPLY_SCHEMA}" == 1 && "${SKIP_SCHEMA_INIT:-0}" != 1 ]]; then
+  apply_schema
+fi
+
 echo ">> done"
 if [[ "${STAGE}" == vpc ]]; then
   echo "   vpc      : $(stack_output "${VPC_STACK_NAME}" VpcId)"
@@ -457,7 +593,13 @@ elif [[ "${STAGE}" == persistence ]]; then
   echo "   dbhost   : $(stack_output "${PERSISTENCE_STACK_NAME}" DBHost)"
   echo "   dbname   : $(stack_output "${PERSISTENCE_STACK_NAME}" DBName)"
   echo "   dbsg     : $(stack_output "${PERSISTENCE_STACK_NAME}" DBSecurityGroupId)"
+elif [[ "${STAGE}" == schema ]]; then
+  echo "   instance : $(output QueryInstanceId)"
+  echo "   schema   : ${SCHEMA_SQL#${ROOT}/}"
 else
+  if [[ "${DEPLOY_VPC}" == 1 ]]; then
+    echo "   vpc      : $(stack_output "${VPC_STACK_NAME}" VpcId)"
+  fi
   echo "   frontend : $(output FrontendURL)"
   echo "   bucket   : $(output FrontendBucketName)"
   echo "   capture  : $(output CaptureEndpoint)"

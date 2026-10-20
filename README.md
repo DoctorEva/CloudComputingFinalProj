@@ -174,17 +174,22 @@ service stack imports, so deploy it before the service stack.
 
 `deploy.sh` deploys the network stack, deploys
 `templates/ImagePersistanceInfrastructrure.yaml`, builds the artifacts, deploys
-`templates/ImageServiceInfrastructrure.yaml`, and publishes the frontend. The
-stage argument selects how much of that it does:
+`templates/ImageServiceInfrastructrure.yaml`, applies the database schema, and
+publishes the frontend. The stage argument selects how much of that it does:
 
 | Stage | Builds | Deploys stack | Syncs frontend |
 | --- | --- | --- | --- |
 | `vpc` | nothing | network | no |
 | `persistence` | nothing | data layer | no |
-| `all` (default) | capture + query | persistence + service | yes |
+| `all` (default) | capture + query | network + persistence + service | yes |
 | `lambda` | capture | service | no |
 | `query` | query | service | no |
 | `frontend` | nothing | no | yes |
+| `schema` | nothing | no | no |
+
+Every service stage (`all`, `lambda`, `query`, and a cold start) also applies
+`db/schema.sql`, and `schema` applies it without touching the stack, which is
+how an existing deployment that predates this step gets its table.
 
 ```bash
 # First setup: create the network stack
@@ -193,7 +198,8 @@ stage argument selects how much of that it does:
 # Create the data layer (image bucket, RDS, DB security group)
 DB_PASSWORD=<password> ./deploy.sh persistence
 
-# Everything else: persistence (if missing), capture Lambda, query tier, frontend
+# Everything else: network, persistence (if missing), capture Lambda, query tier,
+# frontend
 DB_PASSWORD=<password> ./deploy.sh all
 
 # Just the capture Lambda after editing lambda_function.py
@@ -201,19 +207,29 @@ DB_PASSWORD=<password> ./deploy.sh lambda
 
 # Just re-publish the static frontend
 ./deploy.sh frontend
+
+# Apply db/schema.sql to the existing database (no stack update)
+./deploy.sh schema
 ```
 
 `DB_PASSWORD` is required for the stages that touch the persistence or service
 stacks. `QUERY_VPC_ID`, `QUERY_SUBNET_ID`, `ALB_SUBNET_IDS`, and
 `PRIVATE_SUBNET_IDS` are read from the network stack outputs (`VpcId`,
 `PrivateSubnet`, `PublicSubnetIds`, `PrivateSubnetIds`) when they are not set in
-the environment; an environment value wins over the stack output. If the network
-stack does not exist and the variables are unset, the script stops and tells you
-to run `./deploy.sh vpc` first. A stage that finds no existing service stack is
-upgraded to a cold start, which deploys the persistence stack, builds both
-artifacts, and resolves the network the same way. The service stack imports the
-persistence stack exports, so `lambda` and `query` require the persistence stack
-to already exist.
+the environment; an environment value wins over the stack output. The `all`
+stage deploys the network stack first, so it works against a clean account.
+Every other stage that needs the network requires it to exist already: if the
+network stack is missing and the variables are unset, the script stops and
+tells you to run `./deploy.sh vpc` first. A stage that finds no existing service
+stack is upgraded to a cold start, which deploys the persistence stack, builds
+both artifacts, and resolves the network the same way. The service stack imports
+the persistence stack exports, so `lambda` and `query` require the persistence
+stack to already exist.
+
+Both S3 buckets are created with `DeletionPolicy: Retain`, so deleting or rolling
+back a stack can leave them behind. A later deploy then fails with
+`... already exists`; delete the leftover bucket or set `IMAGE_BUCKET_NAME` or
+`FRONTEND_BUCKET_NAME` to a name that is not in use.
 
 Both S3 buckets are created with `DeletionPolicy: Retain`, so deleting or rolling
 back a stack can leave them behind. A later deploy then fails with
@@ -228,6 +244,17 @@ it installs the new code. Replacing that instance leaves the query routes
 unhealthy for a few minutes while it bootstraps, so the script waits for
 `/health` afterwards (set `SKIP_HEALTH_WAIT=1` to skip).
 
+The schema step runs over SSM on the query instance, because the database is not
+reachable from outside the VPC. It sends `db/schema.sql` and `db/apply_schema.py`
+to the instance, which reads the database credentials from the query service's
+environment file or systemd unit, so the password never appears in the SSM
+command or its CloudTrail record. The step waits for the instance to register
+with SSM, then fails the deploy if the SQL fails, so a broken schema cannot pass
+silently. Set `SKIP_SCHEMA_INIT=1` to skip it and `SSM_WAIT_TIMEOUT` (default
+300 seconds) to change the wait. The deployer needs `ssm:SendCommand`,
+`ssm:GetCommandInvocation`, and `ssm:DescribeInstanceInformation`; the query
+instance role already carries `AmazonSSMManagedInstanceCore`.
+
 `AWS_REGION`, `STACK_NAME`, `VPC_STACK_NAME`, `ARTIFACT_BUCKET`,
 `LAMBDA_CODE_KEY`, `QUERY_CODE_KEY`, and other overrides are documented at the
 top of `deploy.sh`.
@@ -235,11 +262,13 @@ top of `deploy.sh`.
 ## Database Definition
 
 The persistence stack creates the database (`imagemetadata` by default; the RDS
-`DBName` property only accepts letters and numbers). The `images` table is
-created separately:
+`DBName` property only accepts letters and numbers). The schema lives in
+`db/schema.sql` and is applied by `deploy.sh`, so a fresh deploy needs no manual
+SQL. `db/apply_schema.py` executes the file on the query instance, and every
+statement must be idempotent because the file is re-applied on each deploy:
 
 ```sql
-CREATE TABLE images (
+CREATE TABLE IF NOT EXISTS images (
     `s3url` VARCHAR(256) CHARACTER SET ascii NOT NULL,
     `name` VARCHAR(255) DEFAULT NULL,
     `location` VARCHAR(255) DEFAULT NULL,
